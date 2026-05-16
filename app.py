@@ -1,6 +1,4 @@
 import streamlit as st
-
-import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
@@ -56,12 +54,19 @@ def score_stock(df):
     reasons = []
     latest = df.iloc[-1]
 
-    price = float(latest["Close"])
-    ma20 = float(latest["MA20"])
-    ma50 = float(latest["MA50"])
-    rsi = float(latest["RSI"])
-    vol = float(latest["Volume"])
-    avg_vol = float(latest["VolumeAvg"])
+    # Fix for yfinance multi-level columns
+    def val(col):
+        v = latest[col]
+        if hasattr(v, 'iloc'):
+            return float(v.iloc[0])
+        return float(v)
+
+    price = val("Close")
+    ma20 = val("MA20")
+    ma50 = val("MA50")
+    rsi = val("RSI")
+    vol = val("Volume")
+    avg_vol = val("VolumeAvg")
 
     if price > ma50:
         score += 20
@@ -94,12 +99,15 @@ def score_stock(df):
 @st.cache_data(ttl=300)
 def get_data(ticker, period):
     df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    # Flatten multi-level columns yfinance sometimes returns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     return df
 
 # ── Tab layout ────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["Watchlist Overview", "Deep Dive", "Paper Trade Log"])
 
-# ── TAB 1: Watchlist overview (all tickers) ───────────────────────────────────
+# ── TAB 1: Watchlist overview ─────────────────────────────────────────────────
 with tab1:
     for ticker in tickers:
         st.subheader(ticker)
@@ -118,10 +126,15 @@ with tab1:
         latest = data.iloc[-1]
         score, reasons = score_stock(data)
 
+        def safe_float(val):
+            if hasattr(val, 'iloc'):
+                return float(val.iloc[0])
+            return float(val)
+
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Close", f"${float(latest['Close']):.2f}")
-        col2.metric("RSI", f"{float(latest['RSI']):.1f}")
-        col3.metric("Volume", f"{float(latest['Volume']):,.0f}")
+        col1.metric("Close", f"${safe_float(latest['Close']):.2f}")
+        col2.metric("RSI", f"{safe_float(latest['RSI']):.1f}")
+        col3.metric("Volume", f"{safe_float(latest['Volume']):,.0f}")
         col4.metric("AI Score", f"{score}/100")
 
         if score >= 70:
@@ -146,7 +159,7 @@ with tab1:
 
         st.divider()
 
-# ── TAB 2: Deep dive (single selected ticker + AI) ────────────────────────────
+# ── TAB 2: Deep dive ──────────────────────────────────────────────────────────
 with tab2:
     st.subheader(f"Deep Dive: {selected}")
     raw = get_data(selected, period)
@@ -158,6 +171,11 @@ with tab2:
         latest = data.iloc[-1]
         score, reasons = score_stock(data)
 
+        def safe_float(val):
+            if hasattr(val, 'iloc'):
+                return float(val.iloc[0])
+            return float(val)
+
         if score >= 70:
             sentiment = "Bullish"
         elif score >= 50:
@@ -168,8 +186,8 @@ with tab2:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Score", f"{score}/100")
         col2.metric("Signal", sentiment)
-        col3.metric("RSI", f"{float(latest['RSI']):.1f}")
-        col4.metric("Close", f"${float(latest['Close']):.2f}")
+        col3.metric("RSI", f"{safe_float(latest['RSI']):.1f}")
+        col4.metric("Close", f"${safe_float(latest['Close']):.2f}")
 
         fig2 = go.Figure()
         fig2.add_trace(go.Candlestick(
@@ -193,7 +211,7 @@ with tab2:
             Stock: {selected}
             Score: {score}/100
             Signal: {sentiment}
-            RSI: {float(latest['RSI']):.1f}
+            RSI: {safe_float(latest['RSI']):.1f}
             Score reasons: {', '.join(reasons)}
 
             Write a 3-sentence plain English summary of this stock's current technical setup.
@@ -221,6 +239,8 @@ with tab3:
         trade_action = c2.selectbox("Action", ["BUY", "SELL"])
 
         raw_log = get_data(trade_ticker, "5d")
+        if isinstance(raw_log.columns, pd.MultiIndex):
+            raw_log.columns = raw_log.columns.get_level_values(0)
         default_price = float(raw_log["Close"].iloc[-1]) if not raw_log.empty else 100.0
         trade_price = c3.number_input("Price", value=default_price)
 
