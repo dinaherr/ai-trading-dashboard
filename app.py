@@ -15,6 +15,7 @@ alpha_key = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
 
 if not openai_key:
     st.sidebar.warning("OpenAI key missing — AI summaries disabled")
+    client = None
 else:
     client = OpenAI(api_key=openai_key)
 
@@ -35,6 +36,11 @@ with st.sidebar:
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 # ── Helper functions ──────────────────────────────────────────────────────────
+def safe_float(val):
+    if hasattr(val, 'iloc'):
+        return float(val.iloc[0])
+    return float(val)
+
 def calculate_rsi(data, window=14):
     delta = data["Close"].diff()
     gain = delta.where(delta > 0, 0).rolling(window).mean()
@@ -54,19 +60,12 @@ def score_stock(df):
     reasons = []
     latest = df.iloc[-1]
 
-    # Fix for yfinance multi-level columns
-    def val(col):
-        v = latest[col]
-        if hasattr(v, 'iloc'):
-            return float(v.iloc[0])
-        return float(v)
-
-    price = val("Close")
-    ma20 = val("MA20")
-    ma50 = val("MA50")
-    rsi = val("RSI")
-    vol = val("Volume")
-    avg_vol = val("VolumeAvg")
+    price   = safe_float(latest["Close"])
+    ma20    = safe_float(latest["MA20"])
+    ma50    = safe_float(latest["MA50"])
+    rsi     = safe_float(latest["RSI"])
+    vol     = safe_float(latest["Volume"])
+    avg_vol = safe_float(latest["VolumeAvg"])
 
     if price > ma50:
         score += 20
@@ -96,10 +95,44 @@ def score_stock(df):
 
     return max(0, min(100, int(score))), reasons
 
+def generate_ai_analysis(ticker, latest, score):
+    prompt = f"""
+    You are an AI stock research assistant for paper trading only.
+    Analyze this ticker using the provided technical indicators.
+
+    Ticker: {ticker}
+    Latest Close: {safe_float(latest['Close']):.2f}
+    RSI: {safe_float(latest['RSI']):.1f}
+    Volume: {safe_float(latest['Volume']):.0f}
+    20-day Moving Average: {safe_float(latest['MA20']):.2f}
+    50-day Moving Average: {safe_float(latest['MA50']):.2f}
+    Score: {score}/100
+
+    Please explain:
+    1. Whether this looks bullish, neutral, or weak and why
+    2. What the moving averages suggest about the trend
+    3. What the RSI level means right now
+    4. Whether volume supports or weakens the move
+    5. One specific thing a paper trader should watch for next
+
+    Keep it beginner-friendly. Be specific to this ticker's numbers.
+    End with a disclaimer that this is not financial advice.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You explain stock setups clearly for beginner paper traders. Be specific, concise, and use plain English."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=400
+    )
+    return response.choices[0].message.content
+
 @st.cache_data(ttl=300)
 def get_data(ticker, period):
     df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
-    # Flatten multi-level columns yfinance sometimes returns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
@@ -126,15 +159,10 @@ with tab1:
         latest = data.iloc[-1]
         score, reasons = score_stock(data)
 
-        def safe_float(val):
-            if hasattr(val, 'iloc'):
-                return float(val.iloc[0])
-            return float(val)
-
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Close", f"${safe_float(latest['Close']):.2f}")
-        col2.metric("RSI", f"{safe_float(latest['RSI']):.1f}")
-        col3.metric("Volume", f"{safe_float(latest['Volume']):,.0f}")
+        col1.metric("Close",    f"${safe_float(latest['Close']):.2f}")
+        col2.metric("RSI",      f"{safe_float(latest['RSI']):.1f}")
+        col3.metric("Volume",   f"{safe_float(latest['Volume']):,.0f}")
         col4.metric("AI Score", f"{score}/100")
 
         if score >= 70:
@@ -157,6 +185,16 @@ with tab1:
             for r in reasons:
                 st.write(f"• {r}")
 
+        # AI Analysis button per ticker
+        with st.expander("AI Assistant Analysis"):
+            if client is None:
+                st.warning("Add your OPENAI_API_KEY in Streamlit Secrets to enable this.")
+            else:
+                if st.button(f"Generate AI Analysis for {ticker}", key=f"ai_{ticker}"):
+                    with st.spinner(f"Analyzing {ticker}..."):
+                        analysis = generate_ai_analysis(ticker, latest, score)
+                        st.write(analysis)
+
         st.divider()
 
 # ── TAB 2: Deep dive ──────────────────────────────────────────────────────────
@@ -171,11 +209,6 @@ with tab2:
         latest = data.iloc[-1]
         score, reasons = score_stock(data)
 
-        def safe_float(val):
-            if hasattr(val, 'iloc'):
-                return float(val.iloc[0])
-            return float(val)
-
         if score >= 70:
             sentiment = "Bullish"
         elif score >= 50:
@@ -184,10 +217,10 @@ with tab2:
             sentiment = "Bearish"
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Score", f"{score}/100")
+        col1.metric("Score",  f"{score}/100")
         col2.metric("Signal", sentiment)
-        col3.metric("RSI", f"{safe_float(latest['RSI']):.1f}")
-        col4.metric("Close", f"${safe_float(latest['Close']):.2f}")
+        col3.metric("RSI",    f"{safe_float(latest['RSI']):.1f}")
+        col4.metric("Close",  f"${safe_float(latest['Close']):.2f}")
 
         fig2 = go.Figure()
         fig2.add_trace(go.Candlestick(
@@ -202,28 +235,13 @@ with tab2:
         for r in reasons:
             st.write(f"• {r}")
 
-        # AI explanation
         st.subheader("AI Summary")
-        if not openai_key:
+        if client is None:
             st.warning("Add your OPENAI_API_KEY in Streamlit Secrets to enable this.")
-        elif st.button("Generate AI Summary"):
-            prompt = f"""
-            Stock: {selected}
-            Score: {score}/100
-            Signal: {sentiment}
-            RSI: {safe_float(latest['RSI']):.1f}
-            Score reasons: {', '.join(reasons)}
-
-            Write a 3-sentence plain English summary of this stock's current technical setup.
-            Be direct. Do not use financial jargon. End with one sentence about what to watch for next.
-            """
-            with st.spinner("Asking AI..."):
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=200
-                )
-                st.info(response.choices[0].message.content)
+        elif st.button("Generate AI Summary", key="ai_deepdive"):
+            with st.spinner("Analyzing..."):
+                analysis = generate_ai_analysis(selected, latest, score)
+                st.info(analysis)
 
 # ── TAB 3: Paper trade log ────────────────────────────────────────────────────
 with tab3:
