@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import sqlite3
 import os
 import requests
@@ -11,7 +11,7 @@ import requests
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI Trading Dashboard", layout="wide")
 st.title("AI Trading Research Dashboard")
-st.caption("Phase 1 + Phase 2: Watchlist, charts, indicators, scoring, AI summaries, news sentiment")
+st.caption("Phase 1 + Phase 2: Watchlist, charts, indicators, scoring, news sentiment, insider trades")
 
 # ── Database setup ────────────────────────────────────────────────────────────
 DB_PATH = "data/trades.db"
@@ -34,6 +34,14 @@ def init_db():
             signal TEXT,
             notes TEXT,
             status TEXT DEFAULT 'Open'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_name TEXT,
+            usage_date TEXT,
+            count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -71,40 +79,88 @@ def delete_trade(trade_id):
 
 init_db()
 
-# ── API key validation ────────────────────────────────────────────────────────
-openai_key   = st.secrets.get("OPENAI_API_KEY", None)
-alpha_key    = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
-finnhub_key  = st.secrets.get("FINNHUB_API_KEY", None)
-sec_agent    = st.secrets.get("SEC_USER_AGENT", "MyApp myemail@email.com")
+# ── API request counter ───────────────────────────────────────────────────────
+AV_DAILY_LIMIT      = 25
+FINNHUB_DAILY_LIMIT = 60
 
-if not openai_key:
-    st.sidebar.warning("OpenAI key missing — AI summaries disabled")
-    client = None
-else:
-    client = OpenAI(api_key=openai_key)
+def get_usage_today(api_name):
+    today = date.today().isoformat()
+    conn  = sqlite3.connect(DB_PATH)
+    c     = conn.cursor()
+    c.execute("SELECT count FROM api_usage WHERE api_name=? AND usage_date=?", (api_name, today))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def increment_usage(api_name, amount=1):
+    today = date.today().isoformat()
+    conn  = sqlite3.connect(DB_PATH)
+    c     = conn.cursor()
+    c.execute("SELECT count FROM api_usage WHERE api_name=? AND usage_date=?", (api_name, today))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE api_usage SET count=count+? WHERE api_name=? AND usage_date=?", (amount, api_name, today))
+    else:
+        c.execute("INSERT INTO api_usage (api_name, usage_date, count) VALUES (?,?,?)", (api_name, today, amount))
+    conn.commit()
+    conn.close()
+
+def requests_remaining(api_name, limit):
+    return max(0, limit - get_usage_today(api_name))
+
+# ── API keys ──────────────────────────────────────────────────────────────────
+openai_key  = st.secrets.get("OPENAI_API_KEY", None)
+alpha_key   = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
+finnhub_key = st.secrets.get("FINNHUB_API_KEY", None)
+sec_agent   = st.secrets.get("SEC_USER_AGENT", "MyApp myemail@email.com")
+
+client = OpenAI(api_key=openai_key) if openai_key else None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Watchlist")
     tickers_input = st.text_input("Enter tickers (comma separated)", "NVDA, CRWD, PANW, AMD, SPY")
-    period = st.selectbox("Time period", ["3mo", "6mo", "1y", "2y"], index=1)
-    selected = st.selectbox(
+    period        = st.selectbox("Time period", ["3mo", "6mo", "1y", "2y"], index=1)
+    selected      = st.selectbox(
         "Deep-dive ticker",
         [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
     )
 
     st.divider()
-    st.header("Phase 2")
-    st.caption("✅ News sentiment")
-    st.caption("🔒 SEC insider trades (next)")
-    st.caption("🔒 Finnhub insider trades (next)")
-    st.caption("🔒 Politician trades")
-    st.caption("🔒 FDA catalysts")
-    st.caption("🔒 Earnings transcripts")
+    st.header("API Budget Today")
+
+    av_used      = get_usage_today("alpha_vantage")
+    av_remaining = requests_remaining("alpha_vantage", AV_DAILY_LIMIT)
+    st.metric("Alpha Vantage", f"{av_remaining} / {AV_DAILY_LIMIT} left")
+    st.progress(min(av_used / AV_DAILY_LIMIT, 1.0))
+    if av_remaining <= 5:
+        st.error(f"Only {av_remaining} AV requests left!")
+    elif av_remaining <= 10:
+        st.warning(f"{av_remaining} AV requests left today")
+
+    fh_used      = get_usage_today("finnhub")
+    fh_remaining = requests_remaining("finnhub", FINNHUB_DAILY_LIMIT)
+    st.metric("Finnhub", f"{fh_remaining} / {FINNHUB_DAILY_LIMIT} left")
+    st.progress(min(fh_used / FINNHUB_DAILY_LIMIT, 1.0))
+    if fh_remaining <= 10:
+        st.warning(f"{fh_remaining} Finnhub requests left today")
+
+    st.caption("All counters reset at midnight.")
+
+    st.divider()
+    st.header("Phase 2 Status")
+    st.caption("✅ News sentiment (Alpha Vantage)")
+    st.caption("✅ Insider trades (Finnhub)")
+    st.caption("✅ Phase 2 score adjustment")
+    st.caption("✅ Phase 2 signal table")
+    st.caption("✅ AI includes Phase 2 signals")
+    st.caption("🔒 Politician trades (Phase 3)")
+    st.caption("🔒 FDA catalysts (Phase 3)")
+    st.caption("🔒 Earnings transcripts (Phase 3)")
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# ── Helper functions ──────────────────────────────────────────────────────────
+# ── Core helpers ──────────────────────────────────────────────────────────────
 def safe_float(val):
     if hasattr(val, 'iloc'):
         return float(val.iloc[0])
@@ -124,7 +180,8 @@ def add_indicators(df):
     df["VolumeAvg"] = df["Volume"].rolling(20).mean()
     return df.dropna()
 
-def score_stock(df):
+# ── Prompt 3: Score with optional Phase 2 signals ────────────────────────────
+def score_stock(df, news_sentiment=None, insider_signal=None):
     score   = 50
     reasons = []
     latest  = df.iloc[-1]
@@ -136,6 +193,7 @@ def score_stock(df):
     vol     = safe_float(latest["Volume"])
     avg_vol = safe_float(latest["VolumeAvg"])
 
+    # Phase 1 signals
     if price > ma50:
         score += 20
         reasons.append("Price above 50-day MA (+20)")
@@ -162,6 +220,29 @@ def score_stock(df):
     else:
         reasons.append("Volume below average (no change)")
 
+    # Phase 2 signals
+    if news_sentiment:
+        label = news_sentiment.get("sentiment_label", "Neutral")
+        avg   = news_sentiment.get("avg_score", 0)
+        if label == "Bullish":
+            score += 10
+            reasons.append(f"News sentiment Bullish (score {avg:+.3f}) (+10)")
+        elif label == "Bearish":
+            score -= 10
+            reasons.append(f"News sentiment Bearish (score {avg:+.3f}) (-10)")
+        else:
+            reasons.append(f"News sentiment Neutral (score {avg:+.3f}) (no change)")
+
+    if insider_signal:
+        if insider_signal == "Bullish":
+            score += 10
+            reasons.append("Insider activity Bullish — net buying (+10)")
+        elif insider_signal == "Bearish":
+            score -= 10
+            reasons.append("Insider activity Bearish — net selling (-10)")
+        else:
+            reasons.append("Insider activity Neutral (no change)")
+
     return max(0, min(100, int(score))), reasons
 
 def get_signal(score):
@@ -171,29 +252,21 @@ def get_signal(score):
         return "Neutral"
     return "Bearish"
 
-# ── Phase 2: News sentiment ───────────────────────────────────────────────────
-@st.cache_data(ttl=1800)  # cache 30 mins — AV has rate limits
-def get_news_sentiment(ticker):
+# ── Prompt 1: News sentiment ──────────────────────────────────────────────────
+def fetch_news_sentiment(ticker):
     if not alpha_key:
         return None, "Alpha Vantage key missing"
-
     try:
-        url = (
+        url  = (
             f"https://www.alphavantage.co/query"
-            f"?function=NEWS_SENTIMENT"
-            f"&tickers={ticker}"
-            f"&limit=20"
-            f"&apikey={alpha_key}"
+            f"?function=NEWS_SENTIMENT&tickers={ticker}&limit=20&apikey={alpha_key}"
         )
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
 
-        # Rate limit check
         if "Information" in data or "Note" in data:
-            msg = data.get("Information") or data.get("Note")
-            return None, f"Rate limit hit: {msg}"
-
-        if "feed" not in data or len(data["feed"]) == 0:
+            return None, data.get("Information") or data.get("Note")
+        if "feed" not in data or not data["feed"]:
             return None, "No news found for this ticker"
 
         articles     = data["feed"]
@@ -201,16 +274,12 @@ def get_news_sentiment(ticker):
         top_articles = []
 
         for article in articles:
-            # Find sentiment score specific to this ticker
-            ticker_sentiments = article.get("ticker_sentiment", [])
-            for ts in ticker_sentiments:
+            for ts in article.get("ticker_sentiment", []):
                 if ts.get("ticker") == ticker:
                     try:
                         scores.append(float(ts["ticker_sentiment_score"]))
                     except:
                         pass
-
-            # Collect top 3 headlines
             if len(top_articles) < 3:
                 top_articles.append({
                     "title":     article.get("title", "No title"),
@@ -220,64 +289,135 @@ def get_news_sentiment(ticker):
                     "sentiment": article.get("overall_sentiment_label", "Neutral")
                 })
 
-        avg_score = sum(scores) / len(scores) if scores else 0.0
-
-        if avg_score >= 0.15:
-            sentiment_label = "Bullish"
-        elif avg_score <= -0.15:
-            sentiment_label = "Bearish"
-        else:
-            sentiment_label = "Neutral"
+        avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+        label     = "Bullish" if avg_score >= 0.15 else ("Bearish" if avg_score <= -0.15 else "Neutral")
 
         return {
-            "article_count":     len(articles),
-            "avg_score":         round(avg_score, 4),
-            "sentiment_label":   sentiment_label,
-            "top_articles":      top_articles,
-            "scored_articles":   len(scores)
+            "article_count":   len(articles),
+            "avg_score":       avg_score,
+            "sentiment_label": label,
+            "top_articles":    top_articles,
+            "scored_articles": len(scores)
         }, None
 
     except requests.exceptions.Timeout:
         return None, "Request timed out — try again"
-    except requests.exceptions.ConnectionError:
-        return None, "Connection error — check your internet"
     except Exception as e:
-        return None, f"Unexpected error: {str(e)}"
+        return None, f"Error: {str(e)}"
 
-# ── AI analysis ───────────────────────────────────────────────────────────────
-def generate_ai_analysis(ticker, latest, score, sentiment_data=None):
+# ── Prompt 2: Insider trades ──────────────────────────────────────────────────
+def fetch_insider_transactions(ticker):
+    if not finnhub_key:
+        return None, "Finnhub key missing"
+    try:
+        url  = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={ticker}&token={finnhub_key}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+
+        transactions = data.get("data", [])
+        if not transactions:
+            return None, "No insider transactions found"
+
+        cutoff = (datetime.now() - timedelta(days=90)).date()
+        recent = []
+        for t in transactions:
+            try:
+                tx_date = datetime.strptime(t.get("transactionDate", ""), "%Y-%m-%d").date()
+                if tx_date >= cutoff:
+                    recent.append(t)
+            except:
+                pass
+
+        if not recent:
+            return None, "No insider transactions in last 90 days"
+
+        buys  = [t for t in recent if t.get("transactionCode") in ["P", "A"]]
+        sells = [t for t in recent if t.get("transactionCode") in ["S", "D"]]
+
+        net_shares = sum(t.get("share", 0) or 0 for t in buys) - sum(t.get("share", 0) or 0 for t in sells)
+
+        if len(buys) > len(sells) and net_shares > 0:
+            insider_signal = "Bullish"
+        elif len(sells) > len(buys) and net_shares < 0:
+            insider_signal = "Bearish"
+        else:
+            insider_signal = "Neutral"
+
+        table_rows = []
+        for t in recent[:10]:
+            table_rows.append({
+                "Date":        t.get("transactionDate", ""),
+                "Name":        t.get("name", "Unknown"),
+                "Type":        "BUY" if t.get("transactionCode") in ["P", "A"] else "SELL",
+                "Shares":      f"{t.get('share', 0):,}",
+                "Price":       f"${t.get('price', 0):.2f}" if t.get("price") else "N/A",
+                "Value":       f"${(t.get('share', 0) or 0) * (t.get('price', 0) or 0):,.0f}"
+            })
+
+        return {
+            "buy_count":       len(buys),
+            "sell_count":      len(sells),
+            "net_shares":      net_shares,
+            "insider_signal":  insider_signal,
+            "recent_count":    len(recent),
+            "transactions":    table_rows
+        }, None
+
+    except requests.exceptions.Timeout:
+        return None, "Request timed out — try again"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+# ── Prompt 4: AI analysis with Phase 2 context ───────────────────────────────
+def generate_ai_analysis(ticker, latest, score, sentiment_data=None, insider_data=None):
     sentiment_block = ""
     if sentiment_data:
+        headlines = "\n".join([f"  - {a['title']} ({a['sentiment']})" for a in sentiment_data.get("top_articles", [])])
         sentiment_block = f"""
-    News Sentiment Score: {sentiment_data['avg_score']}
-    News Sentiment Label: {sentiment_data['sentiment_label']}
-    Articles Analyzed: {sentiment_data['article_count']}
-    """
+News Sentiment:
+  Label: {sentiment_data['sentiment_label']}
+  Avg Score: {sentiment_data['avg_score']}
+  Articles Analyzed: {sentiment_data['article_count']}
+  Top Headlines:
+{headlines}
+"""
+
+    insider_block = ""
+    if insider_data:
+        insider_block = f"""
+Insider Activity (last 90 days):
+  Signal: {insider_data['insider_signal']}
+  Buy transactions: {insider_data['buy_count']}
+  Sell transactions: {insider_data['sell_count']}
+  Net shares bought/sold: {insider_data['net_shares']:,}
+"""
 
     prompt = f"""
-    You are an AI stock research assistant for paper trading only.
-    Analyze this ticker using the provided technical indicators and news sentiment.
+You are an AI stock research assistant for paper trading only.
+Analyze this ticker using technical indicators, news sentiment, and insider activity.
 
-    Ticker: {ticker}
-    Latest Close: {safe_float(latest['Close']):.2f}
-    RSI: {safe_float(latest['RSI']):.1f}
-    Volume: {safe_float(latest['Volume']):.0f}
-    20-day Moving Average: {safe_float(latest['MA20']):.2f}
-    50-day Moving Average: {safe_float(latest['MA50']):.2f}
-    Score: {score}/100
-    {sentiment_block}
+Ticker: {ticker}
+Latest Close: ${safe_float(latest['Close']):.2f}
+RSI: {safe_float(latest['RSI']):.1f}
+Volume: {safe_float(latest['Volume']):.0f}
+20-day MA: ${safe_float(latest['MA20']):.2f}
+50-day MA: ${safe_float(latest['MA50']):.2f}
+Combined Score: {score}/100
+{sentiment_block}
+{insider_block}
 
-    Please explain:
-    1. Whether this looks bullish, neutral, or weak and why
-    2. What the moving averages suggest about the trend
-    3. What the RSI level means right now
-    4. Whether volume supports or weakens the move
-    5. What the news sentiment suggests (if available)
-    6. One specific thing a paper trader should watch for next
+Please explain in plain English:
+1. Whether the technical setup looks bullish, neutral, or weak and why
+2. What the moving averages suggest about the trend
+3. What the RSI level means right now
+4. Whether volume supports or weakens the move
+5. What the news sentiment suggests and how it supports or contradicts the technical picture (if available)
+6. What insider buying or selling activity suggests (if available)
+7. One specific thing a paper trader should watch for next
 
-    Keep it beginner-friendly. Be specific to this ticker's numbers.
-    End with a disclaimer that this is not financial advice.
-    """
+Keep it beginner-friendly. Reference the actual numbers.
+This is for paper trading research only — not financial advice.
+"""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -285,7 +425,7 @@ def generate_ai_analysis(ticker, latest, score, sentiment_data=None):
             {"role": "user",   "content": prompt}
         ],
         temperature=0.3,
-        max_tokens=500
+        max_tokens=600
     )
     return response.choices[0].message.content
 
@@ -305,6 +445,29 @@ def get_current_price(ticker):
     except:
         return None
 
+def render_request_gate(api_name, limit, ticker, label, key_prefix):
+    """Renders the request budget UI and confirmation button. Returns True if user confirmed."""
+    used      = get_usage_today(api_name)
+    remaining = requests_remaining(api_name, limit)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Remaining Today", f"{remaining} / {limit}")
+    c2.metric("Used Today",      str(used))
+    c3.metric("This call costs", "1 request")
+    st.progress(min(used / limit, 1.0))
+
+    if remaining <= 0:
+        st.error(f"No {label} requests left today. Resets at midnight.")
+        return False
+
+    if remaining <= 5:
+        st.error(f"Only {remaining} {label} requests left!")
+    elif remaining <= 10:
+        st.warning(f"{remaining} {label} requests left today")
+
+    st.info(f"Fetching data for **{ticker}** costs **1 request** ({remaining - 1} remaining after).")
+    return st.button(f"Confirm — fetch {label} data for {ticker}", key=f"{key_prefix}_confirm")
+
 # ── Tab layout ────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["Watchlist Overview", "Deep Dive", "Paper Trade Log"])
 
@@ -322,7 +485,7 @@ with tab1:
         if data.empty:
             continue
         all_data[ticker] = data
-        latest = data.iloc[-1]
+        latest   = data.iloc[-1]
         score, _ = score_stock(data)
         signal   = get_signal(score)
         summary_rows.append({
@@ -354,7 +517,6 @@ with tab1:
         signal = get_signal(score)
 
         st.subheader(ticker)
-
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Close",    f"${safe_float(latest['Close']):.2f}")
         col2.metric("RSI",      f"{safe_float(latest['RSI']):.1f}")
@@ -383,17 +545,62 @@ with tab1:
 
         with st.expander("AI Assistant Analysis"):
             if client is None:
-                st.warning("Add your OPENAI_API_KEY in Streamlit Secrets to enable this.")
-            else:
-                if st.button(f"Generate AI Analysis for {ticker}", key=f"ai_{ticker}"):
-                    with st.spinner(f"Analyzing {ticker}..."):
-                        analysis = generate_ai_analysis(ticker, latest, score)
-                        st.write(analysis)
+                st.warning("Add OPENAI_API_KEY to Streamlit Secrets.")
+            elif st.button(f"Generate AI Analysis for {ticker}", key=f"ai_{ticker}"):
+                with st.spinner(f"Analyzing {ticker}..."):
+                    analysis = generate_ai_analysis(ticker, latest, score)
+                    st.write(analysis)
 
         st.divider()
 
-# ── TAB 2: Deep dive + news sentiment ────────────────────────────────────────
+# ── TAB 2: Deep Dive ──────────────────────────────────────────────────────────
 with tab2:
+
+    # ── Prompt 5: Phase 2 signal table ───────────────────────────────────────
+    st.subheader("Phase 2 Signal Summary")
+    st.caption("Uses only locally cached Phase 2 data — no new API calls made here.")
+
+    p2_rows = []
+    for ticker in tickers:
+        raw = get_data(ticker, period)
+        if raw.empty:
+            continue
+        data = add_indicators(raw.copy())
+        if data.empty:
+            continue
+
+        cached_sentiment = st.session_state.get(f"sentiment_{ticker}")
+        cached_insider   = st.session_state.get(f"insider_{ticker}")
+
+        sent_label     = cached_sentiment["sentiment_label"] if cached_sentiment else "—"
+        insider_signal = cached_insider["insider_signal"]    if cached_insider   else "—"
+
+        tech_score, _ = score_stock(data)
+        combined_score, _ = score_stock(
+            data,
+            news_sentiment = cached_sentiment,
+            insider_signal = insider_signal if insider_signal != "—" else None
+        )
+        final_signal = get_signal(combined_score)
+
+        p2_rows.append({
+            "Ticker":         ticker,
+            "Tech Score":     f"{tech_score}/100",
+            "News Sentiment": sent_label,
+            "Insider Signal": insider_signal,
+            "Combined Score": f"{combined_score}/100",
+            "Final Signal":   final_signal
+        })
+
+    if p2_rows:
+        p2_df = pd.DataFrame(p2_rows)
+        p2_df["_sort"] = p2_df["Combined Score"].str.replace("/100", "").astype(int)
+        p2_df = p2_df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+        st.dataframe(p2_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Main deep dive ────────────────────────────────────────────────────────
     st.subheader(f"Deep Dive: {selected}")
     raw = get_data(selected, period)
 
@@ -402,14 +609,23 @@ with tab2:
     else:
         data   = add_indicators(raw.copy())
         latest = data.iloc[-1]
-        score, reasons = score_stock(data)
+
+        cached_sentiment = st.session_state.get(f"sentiment_{selected}")
+        cached_insider   = st.session_state.get(f"insider_{selected}")
+        insider_sig      = cached_insider["insider_signal"] if cached_insider else None
+
+        score, reasons = score_stock(
+            data,
+            news_sentiment = cached_sentiment,
+            insider_signal = insider_sig
+        )
         signal = get_signal(score)
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Score",  f"{score}/100")
-        col2.metric("Signal", signal)
-        col3.metric("RSI",    f"{safe_float(latest['RSI']):.1f}")
-        col4.metric("Close",  f"${safe_float(latest['Close']):.2f}")
+        col1.metric("Combined Score", f"{score}/100")
+        col2.metric("Signal",         signal)
+        col3.metric("RSI",            f"{safe_float(latest['RSI']):.1f}")
+        col4.metric("Close",          f"${safe_float(latest['Close']):.2f}")
 
         fig2 = go.Figure()
         fig2.add_trace(go.Candlestick(
@@ -420,52 +636,107 @@ with tab2:
         fig2.update_layout(height=500, xaxis_rangeslider_visible=False, title=f"{selected} — Deep Dive")
         st.plotly_chart(fig2, use_container_width=True)
 
-        st.subheader("Score breakdown")
-        for r in reasons:
-            st.write(f"• {r}")
+        with st.expander("Score breakdown"):
+            for r in reasons:
+                st.write(f"• {r}")
 
         # ── News sentiment expander ───────────────────────────────────────────
-        with st.expander("News Sentiment", expanded=True):
+        with st.expander("News Sentiment (Alpha Vantage)", expanded=False):
             if not alpha_key:
-                st.warning("Add ALPHA_VANTAGE_API_KEY to Streamlit Secrets to enable news sentiment.")
+                st.warning("Add ALPHA_VANTAGE_API_KEY to Streamlit Secrets.")
             else:
-                with st.spinner(f"Fetching news sentiment for {selected}..."):
-                    sentiment_data, error = get_news_sentiment(selected)
-
-                if error:
-                    st.warning(f"Could not load sentiment: {error}")
-                    sentiment_data = None
-                else:
-                    s_col1, s_col2, s_col3 = st.columns(3)
-                    s_col1.metric("Sentiment",      sentiment_data["sentiment_label"])
-                    s_col2.metric("Avg Score",      sentiment_data["avg_score"])
-                    s_col3.metric("Articles Found", sentiment_data["article_count"])
-
-                    if sentiment_data["sentiment_label"] == "Bullish":
-                        st.success("News sentiment is Bullish for this ticker")
-                    elif sentiment_data["sentiment_label"] == "Bearish":
-                        st.error("News sentiment is Bearish for this ticker")
+                confirmed = render_request_gate(
+                    "alpha_vantage", AV_DAILY_LIMIT, selected,
+                    "Alpha Vantage", f"av_{selected}"
+                )
+                if confirmed:
+                    with st.spinner(f"Fetching news sentiment for {selected}..."):
+                        result, err = fetch_news_sentiment(selected)
+                    if err:
+                        st.error(f"Could not load sentiment: {err}")
                     else:
-                        st.info("News sentiment is Neutral for this ticker")
+                        increment_usage("alpha_vantage", 1)
+                        st.session_state[f"sentiment_{selected}"] = result
+                        st.rerun()
+
+                cached = st.session_state.get(f"sentiment_{selected}")
+                if cached:
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric("Sentiment",      cached["sentiment_label"])
+                    s2.metric("Avg Score",      cached["avg_score"])
+                    s3.metric("Articles Found", cached["article_count"])
+
+                    if cached["sentiment_label"] == "Bullish":
+                        st.success("News sentiment is Bullish")
+                    elif cached["sentiment_label"] == "Bearish":
+                        st.error("News sentiment is Bearish")
+                    else:
+                        st.info("News sentiment is Neutral")
 
                     st.markdown("**Top recent headlines:**")
-                    for article in sentiment_data["top_articles"]:
-                        date_str = article['time']
-                        if len(date_str) == 8:
-                            date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-                        st.markdown(
-                            f"- [{article['title']}]({article['url']})  "
-                            f"*{article['source']} · {date_str} · {article['sentiment']}*"
+                    for article in cached["top_articles"]:
+                        t = article["time"]
+                        if len(t) == 8:
+                            t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
+                        st.markdown(f"- [{article['title']}]({article['url']})  \n  *{article['source']} · {t} · {article['sentiment']}*")
+                else:
+                    st.caption("No sentiment data loaded yet. Confirm above to fetch.")
+
+        # ── Insider trades expander ───────────────────────────────────────────
+        with st.expander("Insider Activity (Finnhub)", expanded=False):
+            if not finnhub_key:
+                st.warning("Add FINNHUB_API_KEY to Streamlit Secrets.")
+            else:
+                confirmed_fh = render_request_gate(
+                    "finnhub", FINNHUB_DAILY_LIMIT, selected,
+                    "Finnhub", f"fh_{selected}"
+                )
+                if confirmed_fh:
+                    with st.spinner(f"Fetching insider transactions for {selected}..."):
+                        insider_result, insider_err = fetch_insider_transactions(selected)
+                    if insider_err:
+                        st.error(f"Could not load insider data: {insider_err}")
+                    else:
+                        increment_usage("finnhub", 1)
+                        st.session_state[f"insider_{selected}"] = insider_result
+                        st.rerun()
+
+                cached_ins = st.session_state.get(f"insider_{selected}")
+                if cached_ins:
+                    i1, i2, i3 = st.columns(3)
+                    i1.metric("Insider Signal", cached_ins["insider_signal"])
+                    i2.metric("Buys (90d)",     cached_ins["buy_count"])
+                    i3.metric("Sells (90d)",     cached_ins["sell_count"])
+
+                    net = cached_ins["net_shares"]
+                    if cached_ins["insider_signal"] == "Bullish":
+                        st.success(f"Net insider buying: {net:,} shares")
+                    elif cached_ins["insider_signal"] == "Bearish":
+                        st.error(f"Net insider selling: {net:,} shares")
+                    else:
+                        st.info(f"Mixed insider activity. Net shares: {net:,}")
+
+                    if cached_ins["transactions"]:
+                        st.markdown("**Recent insider transactions:**")
+                        st.dataframe(
+                            pd.DataFrame(cached_ins["transactions"]),
+                            use_container_width=True,
+                            hide_index=True
                         )
+                else:
+                    st.caption("No insider data loaded yet. Confirm above to fetch.")
 
         # ── AI summary ────────────────────────────────────────────────────────
         st.subheader("AI Summary")
         if client is None:
-            st.warning("Add your OPENAI_API_KEY in Streamlit Secrets to enable this.")
+            st.warning("Add OPENAI_API_KEY to Streamlit Secrets.")
         elif st.button("Generate AI Summary", key="ai_deepdive"):
             with st.spinner("Analyzing..."):
-                sent, _ = get_news_sentiment(selected) if alpha_key else (None, None)
-                analysis = generate_ai_analysis(selected, latest, score, sentiment_data=sent)
+                analysis = generate_ai_analysis(
+                    selected, latest, score,
+                    sentiment_data = st.session_state.get(f"sentiment_{selected}"),
+                    insider_data   = st.session_state.get(f"insider_{selected}")
+                )
                 st.info(analysis)
 
 # ── TAB 3: Paper trade log ────────────────────────────────────────────────────
@@ -480,17 +751,17 @@ with tab3:
 
         raw_log = get_data(trade_ticker, "5d")
         default_price = float(raw_log["Close"].iloc[-1]) if not raw_log.empty else 100.0
-        trade_price = c3.number_input("Entry Price", value=default_price)
+        trade_price   = c3.number_input("Entry Price", value=default_price)
 
         raw_ind = get_data(trade_ticker, period)
         if not raw_ind.empty:
-            ind_data        = add_indicators(raw_ind.copy())
-            ind_latest      = ind_data.iloc[-1]
-            trade_score, _  = score_stock(ind_data)
-            trade_signal    = get_signal(trade_score)
-            trade_rsi       = safe_float(ind_latest["RSI"])
-            trade_ma20      = safe_float(ind_latest["MA20"])
-            trade_ma50      = safe_float(ind_latest["MA50"])
+            ind_data       = add_indicators(raw_ind.copy())
+            ind_latest     = ind_data.iloc[-1]
+            trade_score, _ = score_stock(ind_data)
+            trade_signal   = get_signal(trade_score)
+            trade_rsi      = safe_float(ind_latest["RSI"])
+            trade_ma20     = safe_float(ind_latest["MA20"])
+            trade_ma50     = safe_float(ind_latest["MA50"])
         else:
             trade_score  = 0
             trade_signal = "Unknown"
@@ -520,7 +791,7 @@ with tab3:
     trades_df = load_trades()
 
     if trades_df.empty:
-        st.info("No trades logged yet. Use the form above to add one.")
+        st.info("No trades logged yet.")
     else:
         st.subheader("Open Trades")
         open_trades = trades_df[trades_df["status"] == "Open"].copy()
@@ -530,14 +801,13 @@ with tab3:
             for _, row in open_trades.iterrows():
                 current_price = get_current_price(row["ticker"])
                 if current_price and row["entry_price"] > 0:
-                    if row["action"] == "BUY":
-                        gain_pct = ((current_price - row["entry_price"]) / row["entry_price"]) * 100
-                    else:
-                        gain_pct = ((row["entry_price"] - current_price) / row["entry_price"]) * 100
+                    gain_pct = ((current_price - row["entry_price"]) / row["entry_price"]) * 100
+                    if row["action"] == "SELL":
+                        gain_pct = -gain_pct
                     gain_str = f"{gain_pct:+.2f}%"
                 else:
                     current_price = 0.0
-                    gain_str = "N/A"
+                    gain_str      = "N/A"
 
                 entry_dt  = datetime.strptime(row["entry_date"], "%Y-%m-%d %H:%M")
                 days_open = (datetime.now() - entry_dt).days
