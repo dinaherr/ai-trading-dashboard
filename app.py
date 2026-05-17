@@ -6,11 +6,12 @@ from openai import OpenAI
 from datetime import datetime
 import sqlite3
 import os
+import requests
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI Trading Dashboard", layout="wide")
 st.title("AI Trading Research Dashboard")
-st.caption("Phase 1: Watchlist, charts, indicators, scoring, AI summaries, and trade tracking")
+st.caption("Phase 1 + Phase 2: Watchlist, charts, indicators, scoring, AI summaries, news sentiment")
 
 # ── Database setup ────────────────────────────────────────────────────────────
 DB_PATH = "data/trades.db"
@@ -71,8 +72,10 @@ def delete_trade(trade_id):
 init_db()
 
 # ── API key validation ────────────────────────────────────────────────────────
-openai_key = st.secrets.get("OPENAI_API_KEY", None)
-alpha_key  = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
+openai_key   = st.secrets.get("OPENAI_API_KEY", None)
+alpha_key    = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
+finnhub_key  = st.secrets.get("FINNHUB_API_KEY", None)
+sec_agent    = st.secrets.get("SEC_USER_AGENT", "MyApp myemail@email.com")
 
 if not openai_key:
     st.sidebar.warning("OpenAI key missing — AI summaries disabled")
@@ -91,8 +94,10 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("Phase 2 (coming soon)")
-    st.caption("🔒 SEC insider trades")
+    st.header("Phase 2")
+    st.caption("✅ News sentiment")
+    st.caption("🔒 SEC insider trades (next)")
+    st.caption("🔒 Finnhub insider trades (next)")
     st.caption("🔒 Politician trades")
     st.caption("🔒 FDA catalysts")
     st.caption("🔒 Earnings transcripts")
@@ -166,10 +171,92 @@ def get_signal(score):
         return "Neutral"
     return "Bearish"
 
-def generate_ai_analysis(ticker, latest, score):
+# ── Phase 2: News sentiment ───────────────────────────────────────────────────
+@st.cache_data(ttl=1800)  # cache 30 mins — AV has rate limits
+def get_news_sentiment(ticker):
+    if not alpha_key:
+        return None, "Alpha Vantage key missing"
+
+    try:
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=NEWS_SENTIMENT"
+            f"&tickers={ticker}"
+            f"&limit=20"
+            f"&apikey={alpha_key}"
+        )
+        response = requests.get(url, timeout=10)
+        data = response.json()
+
+        # Rate limit check
+        if "Information" in data or "Note" in data:
+            msg = data.get("Information") or data.get("Note")
+            return None, f"Rate limit hit: {msg}"
+
+        if "feed" not in data or len(data["feed"]) == 0:
+            return None, "No news found for this ticker"
+
+        articles     = data["feed"]
+        scores       = []
+        top_articles = []
+
+        for article in articles:
+            # Find sentiment score specific to this ticker
+            ticker_sentiments = article.get("ticker_sentiment", [])
+            for ts in ticker_sentiments:
+                if ts.get("ticker") == ticker:
+                    try:
+                        scores.append(float(ts["ticker_sentiment_score"]))
+                    except:
+                        pass
+
+            # Collect top 3 headlines
+            if len(top_articles) < 3:
+                top_articles.append({
+                    "title":     article.get("title", "No title"),
+                    "source":    article.get("source", "Unknown"),
+                    "url":       article.get("url", ""),
+                    "time":      article.get("time_published", "")[:8],
+                    "sentiment": article.get("overall_sentiment_label", "Neutral")
+                })
+
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        if avg_score >= 0.15:
+            sentiment_label = "Bullish"
+        elif avg_score <= -0.15:
+            sentiment_label = "Bearish"
+        else:
+            sentiment_label = "Neutral"
+
+        return {
+            "article_count":     len(articles),
+            "avg_score":         round(avg_score, 4),
+            "sentiment_label":   sentiment_label,
+            "top_articles":      top_articles,
+            "scored_articles":   len(scores)
+        }, None
+
+    except requests.exceptions.Timeout:
+        return None, "Request timed out — try again"
+    except requests.exceptions.ConnectionError:
+        return None, "Connection error — check your internet"
+    except Exception as e:
+        return None, f"Unexpected error: {str(e)}"
+
+# ── AI analysis ───────────────────────────────────────────────────────────────
+def generate_ai_analysis(ticker, latest, score, sentiment_data=None):
+    sentiment_block = ""
+    if sentiment_data:
+        sentiment_block = f"""
+    News Sentiment Score: {sentiment_data['avg_score']}
+    News Sentiment Label: {sentiment_data['sentiment_label']}
+    Articles Analyzed: {sentiment_data['article_count']}
+    """
+
     prompt = f"""
     You are an AI stock research assistant for paper trading only.
-    Analyze this ticker using the provided technical indicators.
+    Analyze this ticker using the provided technical indicators and news sentiment.
 
     Ticker: {ticker}
     Latest Close: {safe_float(latest['Close']):.2f}
@@ -178,13 +265,15 @@ def generate_ai_analysis(ticker, latest, score):
     20-day Moving Average: {safe_float(latest['MA20']):.2f}
     50-day Moving Average: {safe_float(latest['MA50']):.2f}
     Score: {score}/100
+    {sentiment_block}
 
     Please explain:
     1. Whether this looks bullish, neutral, or weak and why
     2. What the moving averages suggest about the trend
     3. What the RSI level means right now
     4. Whether volume supports or weakens the move
-    5. One specific thing a paper trader should watch for next
+    5. What the news sentiment suggests (if available)
+    6. One specific thing a paper trader should watch for next
 
     Keep it beginner-friendly. Be specific to this ticker's numbers.
     End with a disclaimer that this is not financial advice.
@@ -196,7 +285,7 @@ def generate_ai_analysis(ticker, latest, score):
             {"role": "user",   "content": prompt}
         ],
         temperature=0.3,
-        max_tokens=400
+        max_tokens=500
     )
     return response.choices[0].message.content
 
@@ -221,11 +310,9 @@ tab1, tab2, tab3 = st.tabs(["Watchlist Overview", "Deep Dive", "Paper Trade Log"
 
 # ── TAB 1: Watchlist overview ─────────────────────────────────────────────────
 with tab1:
-
-    # Watchlist summary table
     st.subheader("Watchlist Summary")
     summary_rows = []
-    all_data = {}
+    all_data     = {}
 
     for ticker in tickers:
         raw = get_data(ticker, period)
@@ -250,11 +337,12 @@ with tab1:
 
     if summary_rows:
         summary_df = pd.DataFrame(summary_rows)
+        summary_df["_sort"] = summary_df["Score"].str.replace("/100", "").astype(int)
+        summary_df = summary_df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # Individual ticker charts
     for ticker in tickers:
         if ticker not in all_data:
             st.error(f"No data for {ticker}")
@@ -304,7 +392,7 @@ with tab1:
 
         st.divider()
 
-# ── TAB 2: Deep dive ──────────────────────────────────────────────────────────
+# ── TAB 2: Deep dive + news sentiment ────────────────────────────────────────
 with tab2:
     st.subheader(f"Deep Dive: {selected}")
     raw = get_data(selected, period)
@@ -336,12 +424,48 @@ with tab2:
         for r in reasons:
             st.write(f"• {r}")
 
+        # ── News sentiment expander ───────────────────────────────────────────
+        with st.expander("News Sentiment", expanded=True):
+            if not alpha_key:
+                st.warning("Add ALPHA_VANTAGE_API_KEY to Streamlit Secrets to enable news sentiment.")
+            else:
+                with st.spinner(f"Fetching news sentiment for {selected}..."):
+                    sentiment_data, error = get_news_sentiment(selected)
+
+                if error:
+                    st.warning(f"Could not load sentiment: {error}")
+                    sentiment_data = None
+                else:
+                    s_col1, s_col2, s_col3 = st.columns(3)
+                    s_col1.metric("Sentiment",      sentiment_data["sentiment_label"])
+                    s_col2.metric("Avg Score",      sentiment_data["avg_score"])
+                    s_col3.metric("Articles Found", sentiment_data["article_count"])
+
+                    if sentiment_data["sentiment_label"] == "Bullish":
+                        st.success("News sentiment is Bullish for this ticker")
+                    elif sentiment_data["sentiment_label"] == "Bearish":
+                        st.error("News sentiment is Bearish for this ticker")
+                    else:
+                        st.info("News sentiment is Neutral for this ticker")
+
+                    st.markdown("**Top recent headlines:**")
+                    for article in sentiment_data["top_articles"]:
+                        date_str = article['time']
+                        if len(date_str) == 8:
+                            date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                        st.markdown(
+                            f"- [{article['title']}]({article['url']})  "
+                            f"*{article['source']} · {date_str} · {article['sentiment']}*"
+                        )
+
+        # ── AI summary ────────────────────────────────────────────────────────
         st.subheader("AI Summary")
         if client is None:
             st.warning("Add your OPENAI_API_KEY in Streamlit Secrets to enable this.")
         elif st.button("Generate AI Summary", key="ai_deepdive"):
             with st.spinner("Analyzing..."):
-                analysis = generate_ai_analysis(selected, latest, score)
+                sent, _ = get_news_sentiment(selected) if alpha_key else (None, None)
+                analysis = generate_ai_analysis(selected, latest, score, sentiment_data=sent)
                 st.info(analysis)
 
 # ── TAB 3: Paper trade log ────────────────────────────────────────────────────
@@ -349,7 +473,6 @@ with tab3:
     st.subheader("Paper Trade Log")
     st.caption("Trades are saved permanently. No real money involved.")
 
-    # Log new trade form
     with st.expander("Log a new trade"):
         c1, c2, c3 = st.columns(3)
         trade_ticker = c1.text_input("Ticker", value=selected)
@@ -359,16 +482,15 @@ with tab3:
         default_price = float(raw_log["Close"].iloc[-1]) if not raw_log.empty else 100.0
         trade_price = c3.number_input("Entry Price", value=default_price)
 
-        # Pull current indicators for this ticker to save with trade
         raw_ind = get_data(trade_ticker, period)
         if not raw_ind.empty:
-            ind_data   = add_indicators(raw_ind.copy())
-            ind_latest = ind_data.iloc[-1]
-            trade_score, _ = score_stock(ind_data)
-            trade_signal   = get_signal(trade_score)
-            trade_rsi  = safe_float(ind_latest["RSI"])
-            trade_ma20 = safe_float(ind_latest["MA20"])
-            trade_ma50 = safe_float(ind_latest["MA50"])
+            ind_data        = add_indicators(raw_ind.copy())
+            ind_latest      = ind_data.iloc[-1]
+            trade_score, _  = score_stock(ind_data)
+            trade_signal    = get_signal(trade_score)
+            trade_rsi       = safe_float(ind_latest["RSI"])
+            trade_ma20      = safe_float(ind_latest["MA20"])
+            trade_ma50      = safe_float(ind_latest["MA50"])
         else:
             trade_score  = 0
             trade_signal = "Unknown"
@@ -377,7 +499,6 @@ with tab3:
             trade_ma50   = 0.0
 
         trade_notes = st.text_input("Notes (optional)")
-
         st.caption(f"Will save with: Score {trade_score}/100 | RSI {trade_rsi:.1f} | Signal {trade_signal}")
 
         if st.button("Log Trade"):
@@ -396,13 +517,11 @@ with tab3:
             st.success(f"Logged {trade_action} {trade_ticker} at ${trade_price:.2f}")
             st.rerun()
 
-    # Load and display trades
     trades_df = load_trades()
 
     if trades_df.empty:
         st.info("No trades logged yet. Use the form above to add one.")
     else:
-        # Performance tracking — add current price and gain/loss
         st.subheader("Open Trades")
         open_trades = trades_df[trades_df["status"] == "Open"].copy()
 
@@ -435,16 +554,14 @@ with tab3:
                     "Score@Entry":  f"{row['ai_score']}/100",
                     "RSI@Entry":    f"{row['rsi']:.1f}",
                     "Signal@Entry": row["signal"],
-                    "Notes":        row["notes"],
-                    "Status":       row["status"]
+                    "Notes":        row["notes"]
                 })
 
             perf_df = pd.DataFrame(perf_rows)
             st.dataframe(perf_df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
 
-            # Close or delete individual trades
             st.subheader("Manage trades")
-            trade_ids = open_trades["id"].tolist()
+            trade_ids    = open_trades["id"].tolist()
             trade_labels = [
                 f"{row['ticker']} {row['action']} @ ${row['entry_price']:.2f} ({row['entry_date']})"
                 for _, row in open_trades.iterrows()
@@ -462,7 +579,6 @@ with tab3:
                 st.success("Trade deleted.")
                 st.rerun()
 
-        # Closed trades
         closed_trades = trades_df[trades_df["status"] == "Closed"]
         if not closed_trades.empty:
             st.subheader("Closed Trades")
