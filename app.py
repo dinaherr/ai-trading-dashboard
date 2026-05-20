@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -73,6 +72,7 @@ from modules.discovery import (
     build_display_df,
     get_quick_stats,
 )
+from modules.insider_api import fetch_insider_transactions
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 os.makedirs("data", exist_ok=True)
@@ -156,7 +156,7 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 @st.cache_data(ttl=1800)
 def cached_market_sentiment_scan(key):
     return fetch_market_sentiment_scan(key, increment_usage)
-    
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Watchlist Overview",
@@ -362,7 +362,9 @@ with tab2:
                     get_usage_today, requests_remaining,
                 ):
                     with st.spinner(f"Fetching news sentiment for {selected}..."):
-                        result, err = fetch_news_sentiment(selected, alpha_key, increment_usage)
+                        result, err = fetch_news_sentiment(
+                            selected, alpha_key, increment_usage
+                        )
                     if err:
                         st.error(f"Could not load sentiment: {err}")
                     else:
@@ -370,7 +372,10 @@ with tab2:
                         st.session_state[f"sentiment_{selected}"] = result
                         st.rerun()
 
-                cached = load_news_cache(selected) or st.session_state.get(f"sentiment_{selected}")
+                cached = (
+                    load_news_cache(selected) or
+                    st.session_state.get(f"sentiment_{selected}")
+                )
                 if cached:
                     s1, s2, s3 = st.columns(3)
                     s1.metric("Sentiment Lean",  cached["sentiment_label"])
@@ -411,8 +416,10 @@ with tab2:
                     st.code(build_chatgpt_prompt(
                         selected, latest, score, reasons,
                         sentiment_data=cached,
-                        insider_data=load_insider_cache(selected) or
-                                     st.session_state.get(f"insider_{selected}"),
+                        insider_data=(
+                            load_insider_cache(selected) or
+                            st.session_state.get(f"insider_{selected}")
+                        ),
                     ), language="")
                 else:
                     st.caption("No sentiment data yet. Confirm above to fetch.")
@@ -435,7 +442,6 @@ with tab2:
                     get_usage_today, requests_remaining,
                 ):
                     with st.spinner(f"Fetching insider disclosures for {selected}..."):
-                        from modules.insider_api import fetch_insider_transactions
                         ir, ie = fetch_insider_transactions(
                             selected, finnhub_key, increment_usage
                         )
@@ -446,7 +452,10 @@ with tab2:
                         st.session_state[f"insider_{selected}"] = ir
                         st.rerun()
 
-                ci2 = load_insider_cache(selected) or st.session_state.get(f"insider_{selected}")
+                ci2 = (
+                    load_insider_cache(selected) or
+                    st.session_state.get(f"insider_{selected}")
+                )
                 if ci2:
                     i1, i2, i3 = st.columns(3)
                     i1.metric("Disclosure Signal", ci2["insider_signal"])
@@ -671,8 +680,8 @@ with tab4:
     )
 
     if st.button(f"Scan {category}", key="run_scan"):
-        prog          = st.progress(0)
-        status_text   = st.empty()
+        prog            = st.progress(0)
+        status_text     = st.empty()
         partial_results = []
 
         for i, ticker in enumerate(scan_tickers):
@@ -717,7 +726,7 @@ with tab4:
         st.divider()
         st.subheader("Send a Candidate to Deep Dive")
         st.caption("Select a ticker to investigate further. Then go to Deep Dive + Phase 2 tab.")
-        chosen   = st.selectbox("Select a ticker", scan_df["Ticker"].tolist())
+        chosen = st.selectbox("Select a ticker", scan_df["Ticker"].tolist())
         col_a, col_b = st.columns(2)
 
         if col_a.button(f"Add {chosen} to watchlist"):
@@ -840,11 +849,10 @@ with tab5:
             if val == "Bearish": return "color: red"
             return "color: gray"
 
-       # AFTER
-st.dataframe(
-    table_df.style.map(sentiment_color, subset=["Sentiment"]),
-    use_container_width=True, hide_index=True
-
+        # ── Fix applied: style.map instead of style.applymap ─────────────────
+        st.dataframe(
+            table_df.style.map(sentiment_color, subset=["Sentiment"]),
+            use_container_width=True, hide_index=True
         )
         render_disclaimer(DISCLAIMER)
 
@@ -928,6 +936,7 @@ st.dataframe(
                     f"`{new_input}`  \n"
                     f"Then select **{chosen_scan}** in the Deep Dive dropdown."
                 )
+
         st.info(
             f"**Full research flow for {chosen_scan}:**\n"
             "1. Add to sidebar watchlist\n"
@@ -969,7 +978,7 @@ with tab6:
         "Ticker to look up", value=selected, key="sec_lookup_ticker"
     ).upper().strip()
 
-    sec_rem  = requests_remaining("sec", SEC_DAILY_LIMIT)
+    sec_rem = requests_remaining("sec", SEC_DAILY_LIMIT)
     lookup_col2.metric("SEC Requests Left", f"{sec_rem} / {SEC_DAILY_LIMIT}")
 
     cached_info  = load_sec_company_cache(lookup_ticker)
