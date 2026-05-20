@@ -844,7 +844,7 @@ with tab5:
 st.dataframe(
     table_df.style.map(sentiment_color, subset=["Sentiment"]),
     use_container_width=True, hide_index=True
-)
+
         )
         render_disclaimer(DISCLAIMER)
 
