@@ -4,13 +4,81 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from openai import OpenAI
-from datetime import datetime, date, timedelta
-import sqlite3
+from datetime import datetime, date
 import os
-import requests
-import json
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Modules ───────────────────────────────────────────────────────────────────
+from modules.database import (
+    AV_DAILY_LIMIT,
+    FINNHUB_DAILY_LIMIT,
+    OPENAI_DAILY_LIMIT,
+    SEC_DAILY_LIMIT,
+    init_db,
+    load_trades,
+    save_trade,
+    close_trade,
+    delete_trade,
+    get_usage_today,
+    increment_usage,
+    requests_remaining,
+    save_news_cache,
+    load_news_cache,
+    save_insider_cache,
+    load_insider_cache,
+    save_signal_snapshot,
+    load_signal_history,
+    save_sec_company_cache,
+    load_sec_company_cache,
+    save_sec_filings_cache,
+    load_sec_filings_cache,
+)
+from modules.scoring import (
+    safe_float,
+    add_indicators,
+    score_stock,
+    get_signal,
+    get_signal_short,
+)
+from modules.market_data import (
+    get_data,
+    get_current_price,
+)
+from modules.news_api import (
+    fetch_news_sentiment,
+    fetch_market_sentiment_scan,
+)
+from modules.ai_analysis import (
+    build_chatgpt_prompt,
+    generate_ai_analysis,
+    analyze_articles_with_ai,
+)
+from modules.sec_api import (
+    get_sec_company_info,
+    get_sec_filings,
+)
+from modules.ui_helpers import (
+    render_request_gate,
+    render_openai_gate,
+    render_signal_banner,
+    render_sentiment_banner,
+    render_insider_banner,
+    render_api_budget_sidebar,
+    render_score_breakdown,
+    render_snapshot_status,
+    render_disclaimer,
+)
+from modules.discovery import (
+    get_category_names,
+    get_category_tickers,
+    build_display_df,
+    get_quick_stats,
+)
+
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+os.makedirs("data", exist_ok=True)
+init_db()
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI Trading Research Dashboard", layout="wide")
 st.title("AI Trading Research Dashboard")
 st.caption(
@@ -26,209 +94,14 @@ st.info(
     "Consult a licensed financial professional before investing."
 )
 
-# ── Database setup ────────────────────────────────────────────────────────────
-DB_PATH = "data/trades.db"
-os.makedirs("data", exist_ok=True)
+# ── Constants ─────────────────────────────────────────────────────────────────
+DISCLAIMER = (
+    "*For educational and paper-trading research only. "
+    "Not financial advice. Signals may be delayed or inaccurate. "
+    "Never make real investment decisions based solely on this tool.*"
+)
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_date TEXT, ticker TEXT, action TEXT,
-            entry_price REAL, ai_score INTEGER, rsi REAL,
-            ma20 REAL, ma50 REAL, signal TEXT, notes TEXT,
-            status TEXT DEFAULT 'Open'
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS api_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_name TEXT, usage_date TEXT, count INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS news_cache (
-            ticker TEXT, fetched_date TEXT, article_count INTEGER,
-            avg_score REAL, sentiment_label TEXT, top_articles TEXT,
-            PRIMARY KEY (ticker, fetched_date)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS insider_cache (
-            ticker TEXT, fetched_date TEXT, buy_count INTEGER,
-            sell_count INTEGER, net_shares REAL, insider_signal TEXT,
-            transactions TEXT, PRIMARY KEY (ticker, fetched_date)
-        )
-    """)
-    # Phase 3 — Prompt 1: signal history table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS signal_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT,
-            snapshot_date TEXT,
-            close REAL,
-            rsi REAL,
-            ma20 REAL,
-            ma50 REAL,
-            volume REAL,
-            technical_score INTEGER,
-            news_sentiment_label TEXT,
-            insider_signal TEXT,
-            combined_score INTEGER,
-            final_signal TEXT,
-            notes TEXT,
-            UNIQUE(ticker, snapshot_date)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-# ── Trade CRUD ────────────────────────────────────────────────────────────────
-def load_trades():
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM trades", conn)
-    conn.close()
-    return df
-
-def save_trade(entry_date, ticker, action, entry_price, ai_score, rsi, ma20, ma50, signal, notes):
-    conn = sqlite3.connect(DB_PATH)
-    c    = conn.cursor()
-    c.execute("""
-        INSERT INTO trades
-        (entry_date,ticker,action,entry_price,ai_score,rsi,ma20,ma50,signal,notes,status)
-        VALUES (?,?,?,?,?,?,?,?,?,?,'Open')
-    """, (entry_date, ticker, action, entry_price, ai_score, rsi, ma20, ma50, signal, notes))
-    conn.commit()
-    conn.close()
-
-def close_trade(trade_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.cursor().execute("UPDATE trades SET status='Closed' WHERE id=?", (trade_id,))
-    conn.commit(); conn.close()
-
-def delete_trade(trade_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.cursor().execute("DELETE FROM trades WHERE id=?", (trade_id,))
-    conn.commit(); conn.close()
-
-# ── News/Insider cache ────────────────────────────────────────────────────────
-def save_news_cache(ticker, result):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    conn.cursor().execute("""
-        INSERT OR REPLACE INTO news_cache
-        (ticker,fetched_date,article_count,avg_score,sentiment_label,top_articles)
-        VALUES (?,?,?,?,?,?)
-    """, (ticker, today, result["article_count"], result["avg_score"],
-          result["sentiment_label"], json.dumps(result["top_articles"])))
-    conn.commit(); conn.close()
-
-def load_news_cache(ticker):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    c     = conn.cursor()
-    c.execute("""
-        SELECT article_count,avg_score,sentiment_label,top_articles
-        FROM news_cache WHERE ticker=? AND fetched_date=?
-    """, (ticker, today))
-    row = c.fetchone(); conn.close()
-    if row:
-        return {"article_count": row[0], "avg_score": row[1],
-                "sentiment_label": row[2], "top_articles": json.loads(row[3])}
-    return None
-
-def save_insider_cache(ticker, result):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    conn.cursor().execute("""
-        INSERT OR REPLACE INTO insider_cache
-        (ticker,fetched_date,buy_count,sell_count,net_shares,insider_signal,transactions)
-        VALUES (?,?,?,?,?,?,?)
-    """, (ticker, today, result["buy_count"], result["sell_count"],
-          result["net_shares"], result["insider_signal"],
-          json.dumps(result["transactions"])))
-    conn.commit(); conn.close()
-
-def load_insider_cache(ticker):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    c     = conn.cursor()
-    c.execute("""
-        SELECT buy_count,sell_count,net_shares,insider_signal,transactions
-        FROM insider_cache WHERE ticker=? AND fetched_date=?
-    """, (ticker, today))
-    row = c.fetchone(); conn.close()
-    if row:
-        return {"buy_count": row[0], "sell_count": row[1], "net_shares": row[2],
-                "insider_signal": row[3], "transactions": json.loads(row[4])}
-    return None
-
-# ── Phase 3: Signal history ───────────────────────────────────────────────────
-def save_signal_snapshot(ticker, close, rsi, ma20, ma50, volume,
-                          technical_score, news_sentiment_label,
-                          insider_signal, combined_score, final_signal, notes=""):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    c     = conn.cursor()
-    try:
-        c.execute("""
-            INSERT INTO signal_history
-            (ticker,snapshot_date,close,rsi,ma20,ma50,volume,
-             technical_score,news_sentiment_label,insider_signal,
-             combined_score,final_signal,notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (ticker, today, close, rsi, ma20, ma50, volume,
-              technical_score, news_sentiment_label or "Unavailable",
-              insider_signal or "Unavailable",
-              combined_score, final_signal, notes))
-        conn.commit()
-        result = "saved"
-    except sqlite3.IntegrityError:
-        result = "exists"
-    conn.close()
-    return result
-
-def load_signal_history():
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM signal_history ORDER BY snapshot_date DESC", conn)
-    conn.close()
-    return df
-
-init_db()
-
-# ── API counter ───────────────────────────────────────────────────────────────
-AV_DAILY_LIMIT      = 25
-FINNHUB_DAILY_LIMIT = 60
-OPENAI_DAILY_LIMIT  = 20
-
-def get_usage_today(api_name):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    c     = conn.cursor()
-    c.execute("SELECT count FROM api_usage WHERE api_name=? AND usage_date=?", (api_name, today))
-    row = c.fetchone(); conn.close()
-    return row[0] if row else 0
-
-def increment_usage(api_name, amount=1):
-    today = date.today().isoformat()
-    conn  = sqlite3.connect(DB_PATH)
-    c     = conn.cursor()
-    c.execute("SELECT count FROM api_usage WHERE api_name=? AND usage_date=?", (api_name, today))
-    row = c.fetchone()
-    if row:
-        c.execute("UPDATE api_usage SET count=count+? WHERE api_name=? AND usage_date=?",
-                  (amount, api_name, today))
-    else:
-        c.execute("INSERT INTO api_usage (api_name,usage_date,count) VALUES (?,?,?)",
-                  (api_name, today, amount))
-    conn.commit(); conn.close()
-
-def requests_remaining(api_name, limit):
-    return max(0, limit - get_usage_today(api_name))
-
-# ── API keys ──────────────────────────────────────────────────────────────────
+# ── Secrets ───────────────────────────────────────────────────────────────────
 openai_key  = st.secrets.get("OPENAI_API_KEY", None)
 alpha_key   = st.secrets.get("ALPHA_VANTAGE_API_KEY", None)
 finnhub_key = st.secrets.get("FINNHUB_API_KEY", None)
@@ -238,38 +111,37 @@ client      = OpenAI(api_key=openai_key) if openai_key else None
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Watchlist")
-    tickers_input = st.text_input("Enter tickers (comma separated)", "NVDA, CRWD, PANW, AMD, SPY")
-    period        = st.selectbox("Time period", ["3mo", "6mo", "1y", "2y"], index=1)
-    selected      = st.selectbox(
+    tickers_input = st.text_input(
+        "Enter tickers (comma separated)", "NVDA, CRWD, PANW, AMD, SPY"
+    )
+    period   = st.selectbox("Time period", ["3mo", "6mo", "1y", "2y"], index=1)
+    selected = st.selectbox(
         "Deep-dive ticker",
         [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
     )
 
     st.divider()
-    st.header("API Budget Today")
-    for api, label, limit in [
-        ("alpha_vantage", "Alpha Vantage", AV_DAILY_LIMIT),
-        ("finnhub",       "Finnhub",       FINNHUB_DAILY_LIMIT),
-        ("openai",        "OpenAI calls",  OPENAI_DAILY_LIMIT),
-    ]:
-        used = get_usage_today(api)
-        rem  = requests_remaining(api, limit)
-        st.metric(label, f"{rem} / {limit} left")
-        st.progress(min(used / limit, 1.0))
-        if rem <= 5:
-            st.error(f"Only {rem} {label} requests left!")
-        elif rem <= 10:
-            st.warning(f"{rem} {label} requests left today")
-    st.caption("All counters reset at midnight.")
+    render_api_budget_sidebar(
+        [
+            ("alpha_vantage", "Alpha Vantage", AV_DAILY_LIMIT),
+            ("finnhub",       "Finnhub",       FINNHUB_DAILY_LIMIT),
+            ("openai",        "OpenAI calls",  OPENAI_DAILY_LIMIT),
+            ("sec",           "SEC EDGAR",     SEC_DAILY_LIMIT),
+        ],
+        get_usage_today,
+        requests_remaining,
+    )
 
     st.divider()
     st.header("Build Status")
     st.caption("✅ Phase 1 — Watchlist + charts + scoring")
     st.caption("✅ Phase 2 — News sentiment + insider trades")
     st.caption("✅ Phase 3 — Signal history + backtesting + scanner")
-    st.caption("🔒 Phase 4 — Public disclosure tracker")
-    st.caption("🔒 Phase 4 — FDA catalysts")
-    st.caption("🔒 Phase 4 — Earnings transcripts")
+    st.caption("✅ Phase 4 — SEC company lookup + filings")
+    st.caption("✅ Phase 4 — Market sentiment scanner")
+    st.caption("🔒 Phase 4 next — 13F institutional tracker")
+    st.caption("🔒 Phase 4 next — Politician disclosure tracker")
+    st.caption("🔒 Phase 4 next — Catalyst calendar")
 
     st.divider()
     st.caption(
@@ -280,359 +152,20 @@ with st.sidebar:
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# ── Disclaimer constant ───────────────────────────────────────────────────────
-DISCLAIMER = (
-    "*For educational and paper-trading research only. "
-    "Not financial advice. Signals may be delayed or inaccurate. "
-    "Never make real investment decisions based solely on this tool.*"
-)
-
-# ── Discovery watchlists ──────────────────────────────────────────────────────
-DISCOVERY_LISTS = {
-    "AI & Machine Learning":    ["NVDA", "AMD", "MSFT", "GOOGL", "META", "AMZN", "ORCL", "IBM", "PLTR", "AI"],
-    "Cybersecurity":            ["CRWD", "PANW", "FTNT", "ZS", "S",    "OKTA", "CYBR", "TENB", "RPD", "SAIL"],
-    "Semiconductors":           ["NVDA", "AMD",  "INTC", "QCOM", "AVGO", "MU",   "AMAT", "LRCX", "KLAC", "TSM"],
-    "Defense":                  ["LMT",  "RTX",  "NOC",  "GD",   "BA",   "L3HT", "HII",  "LDOS", "CACI", "SAIC"],
-    "Biotech":                  ["MRNA", "BNTX", "REGN", "VRTX", "BIIB", "GILD", "AMGN", "ILMN", "RARE", "EXAS"],
-    "Cloud & SaaS":             ["CRM",  "NOW",  "SNOW", "DDOG", "MDB",  "NET",  "HUBS", "ZM",   "TEAM", "WDAY"],
-    "Major ETFs":               ["SPY",  "QQQ",  "IWM",  "DIA",  "XLK",  "XLF",  "XLV",  "GLD",  "TLT",  "VIX"],
-    "Mega-Cap Tech":            ["AAPL", "MSFT", "GOOGL","AMZN", "META", "NVDA", "TSLA", "NFLX", "ADBE", "CRM"],
-}
-
-# ── Core helpers ──────────────────────────────────────────────────────────────
-def safe_float(val):
-    if hasattr(val, 'iloc'):
-        return float(val.iloc[0])
-    return float(val)
-
-def calculate_rsi(data, window=14):
-    delta = data["Close"].diff()
-    gain  = delta.where(delta > 0, 0).rolling(window).mean()
-    loss  = -delta.where(delta < 0, 0).rolling(window).mean()
-    rs    = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def add_indicators(df):
-    df["MA20"]      = df["Close"].rolling(20).mean()
-    df["MA50"]      = df["Close"].rolling(50).mean()
-    df["RSI"]       = calculate_rsi(df)
-    df["VolumeAvg"] = df["Volume"].rolling(20).mean()
-    return df.dropna()
-
-def score_stock(df, news_sentiment=None, insider_signal=None):
-    score   = 50
-    reasons = []
-    latest  = df.iloc[-1]
-
-    price   = safe_float(latest["Close"])
-    ma20    = safe_float(latest["MA20"])
-    ma50    = safe_float(latest["MA50"])
-    rsi     = safe_float(latest["RSI"])
-    vol     = safe_float(latest["Volume"])
-    avg_vol = safe_float(latest["VolumeAvg"])
-
-    if price > ma50:
-        score += 20; reasons.append("Price above 50-day MA — historically favorable (+20)")
-    else:
-        score -= 20; reasons.append("Price below 50-day MA — historically weaker setup (-20)")
-
-    if ma20 > ma50:
-        score += 15; reasons.append("20-day MA above 50-day MA — bullish alignment signal (+15)")
-
-    if 45 <= rsi <= 70:
-        score += 15; reasons.append(f"RSI {rsi:.1f} — momentum in healthy range (+15)")
-    elif rsi > 75:
-        score -= 15; reasons.append(f"RSI {rsi:.1f} — potentially overbought (-15)")
-    else:
-        reasons.append(f"RSI {rsi:.1f} — outside ideal range, watch for direction (no change)")
-
-    if vol > avg_vol:
-        score += 10; reasons.append("Volume above 20-day average — move may have conviction (+10)")
-    else:
-        reasons.append("Volume below average — move may lack conviction (no change)")
-
-    if news_sentiment:
-        label = news_sentiment.get("sentiment_label", "Neutral")
-        avg   = news_sentiment.get("avg_score", 0)
-        if label == "Bullish":
-            score += 10; reasons.append(f"News sentiment leaning bullish ({avg:+.3f}) (+10)")
-        elif label == "Bearish":
-            score -= 10; reasons.append(f"News sentiment leaning bearish ({avg:+.3f}) (-10)")
-        else:
-            reasons.append(f"News sentiment neutral ({avg:+.3f}) (no change)")
-
-    if insider_signal:
-        if insider_signal == "Bullish":
-            score += 10; reasons.append("Open-market insider buying detected (+10)")
-        elif insider_signal == "Bearish":
-            score -= 5;  reasons.append("Insider selling detected — may be routine (-5)")
-        else:
-            reasons.append("Insider activity mixed or neutral (no change)")
-
-    return max(0, min(100, int(score))), reasons
-
-def get_signal(score):
-    if score >= 70: return "Bullish signals align"
-    if score >= 50: return "Neutral — watch carefully"
-    return "Weak setup — exercise caution"
-
-def get_signal_short(score):
-    if score >= 70: return "Bullish"
-    if score >= 50: return "Neutral"
-    return "Weak"
-
-@st.cache_data(ttl=300)
-def get_data(ticker, period):
-    df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-def get_current_price(ticker):
-    try:
-        df = yf.download(ticker, period="2d", interval="1d", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return float(df["Close"].iloc[-1]) if not df.empty else None
-    except:
-        return None
-
-# ── News sentiment ────────────────────────────────────────────────────────────
-def fetch_news_sentiment(ticker):
-    if not alpha_key:
-        return None, "Alpha Vantage key missing"
-    try:
-        url = (f"https://www.alphavantage.co/query"
-               f"?function=NEWS_SENTIMENT&tickers={ticker}&limit=20&apikey={alpha_key}")
-        increment_usage("alpha_vantage", 1)
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if "Information" in data or "Note" in data:
-            return None, data.get("Information") or data.get("Note")
-        if "feed" not in data or not data["feed"]:
-            return None, "No news found"
-        articles = data["feed"]
-        scores, top_articles = [], []
-        for article in articles:
-            for ts in article.get("ticker_sentiment", []):
-                if ts.get("ticker") == ticker:
-                    try: scores.append(float(ts["ticker_sentiment_score"]))
-                    except: pass
-            if len(top_articles) < 5:
-                top_articles.append({
-                    "title":     article.get("title", "No title"),
-                    "source":    article.get("source", "Unknown"),
-                    "url":       article.get("url", ""),
-                    "time":      article.get("time_published", "")[:8],
-                    "sentiment": article.get("overall_sentiment_label", "Neutral"),
-                    "summary":   article.get("summary", "")
-                })
-        avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
-        label = "Bullish" if avg_score >= 0.15 else ("Bearish" if avg_score <= -0.15 else "Neutral")
-        return {"article_count": len(articles), "avg_score": avg_score,
-                "sentiment_label": label, "top_articles": top_articles,
-                "scored_articles": len(scores)}, None
-    except requests.exceptions.Timeout:
-        return None, "Request timed out"
-    except Exception as e:
-        return None, f"Error: {str(e)}"
-
-# ── Insider trades ────────────────────────────────────────────────────────────
-def fetch_insider_transactions(ticker):
-    if not finnhub_key:
-        return None, "Finnhub key missing"
-    try:
-        url = (f"https://finnhub.io/api/v1/stock/insider-transactions"
-               f"?symbol={ticker}&token={finnhub_key}")
-        increment_usage("finnhub", 1)
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        transactions = data.get("data", [])
-        if not transactions:
-            return None, "No insider transactions found"
-        cutoff = (datetime.now() - timedelta(days=90)).date()
-        recent = []
-        for t in transactions:
-            try:
-                if datetime.strptime(t.get("transactionDate", ""), "%Y-%m-%d").date() >= cutoff:
-                    recent.append(t)
-            except: pass
-        if not recent:
-            return None, "No transactions in last 90 days"
-        open_buys  = [t for t in recent if t.get("transactionCode") == "P"]
-        all_buys   = [t for t in recent if t.get("transactionCode") in ["P", "A"]]
-        open_sells = [t for t in recent if t.get("transactionCode") == "S"]
-        all_sells  = [t for t in recent if t.get("transactionCode") in ["S", "D"]]
-        net_shares = (sum(t.get("share", 0) or 0 for t in all_buys) -
-                      sum(t.get("share", 0) or 0 for t in all_sells))
-        if len(open_buys) > 0 and len(open_buys) >= len(open_sells):
-            insider_signal = "Bullish"
-        elif len(open_sells) > len(open_buys) * 2:
-            insider_signal = "Bearish"
-        else:
-            insider_signal = "Neutral"
-        table_rows = []
-        for t in recent[:10]:
-            code = t.get("transactionCode", "")
-            table_rows.append({
-                "Date":   t.get("transactionDate", ""),
-                "Name":   t.get("name", "Unknown"),
-                "Type":   ("Open-Market Buy"   if code == "P" else
-                           "Grant/Award"        if code == "A" else
-                           "Open-Market Sell"   if code == "S" else
-                           "Planned/Auto Sell"),
-                "Shares": f"{t.get('share', 0):,}",
-                "Price":  f"${t.get('price', 0):.2f}" if t.get("price") else "N/A",
-                "Value":  f"${(t.get('share', 0) or 0) * (t.get('price', 0) or 0):,.0f}"
-            })
-        return {"buy_count": len(all_buys), "sell_count": len(all_sells),
-                "open_buy_count": len(open_buys), "open_sell_count": len(open_sells),
-                "net_shares": net_shares, "insider_signal": insider_signal,
-                "recent_count": len(recent), "transactions": table_rows}, None
-    except requests.exceptions.Timeout:
-        return None, "Request timed out"
-    except Exception as e:
-        return None, f"Error: {str(e)}"
-
-# ── ChatGPT prompt builder ────────────────────────────────────────────────────
-def build_chatgpt_prompt(ticker, latest, score, reasons, sentiment_data=None, insider_data=None):
-    lines = [
-        "You are an AI stock research assistant for paper trading and educational purposes only.",
-        f"Analyze the following publicly available data for {ticker}.",
-        "",
-        "Return clearly labeled sections:",
-        "1. Bullish factors (what looks favorable)",
-        "2. Bearish risks (what looks concerning)",
-        "3. Neutral or unclear points",
-        "4. Possible near-term market impact to watch",
-        "5. What a paper trader might monitor next",
-        "",
-        "Rules: Do not say buy or sell. Do not predict prices. Use hedged language.",
-        "End with: This analysis is for paper trading and educational research only. Not financial advice.",
-        "",
-        f"--- TECHNICAL DATA FOR {ticker} ---",
-        f"Close: ${safe_float(latest['Close']):.2f}",
-        f"RSI: {safe_float(latest['RSI']):.1f}",
-        f"MA20: ${safe_float(latest['MA20']):.2f}",
-        f"MA50: ${safe_float(latest['MA50']):.2f}",
-        f"Volume: {safe_float(latest['Volume']):,.0f}",
-        f"Research Score: {score}/100 (educational metric only)",
-        "", "Score signals:",
-    ]
-    for r in reasons:
-        lines.append(f"  - {r}")
-    if sentiment_data:
-        lines += ["", "--- PUBLIC NEWS SENTIMENT ---",
-                  f"Label: {sentiment_data['sentiment_label']}",
-                  f"Avg Score: {sentiment_data['avg_score']}",
-                  f"Articles: {sentiment_data['article_count']}", "Headlines:"]
-        for a in sentiment_data["top_articles"]:
-            lines.append(f"  - [{a['sentiment']}] {a['title']} ({a['source']})")
-            if a.get("summary"):
-                lines.append(f"    {a['summary'][:200]}...")
-    if insider_data:
-        lines += ["", "--- PUBLIC INSIDER DISCLOSURES (SEC filings, last 90 days) ---",
-                  f"Signal: {insider_data['insider_signal']}",
-                  f"Open-market buys: {insider_data.get('open_buy_count', insider_data['buy_count'])}",
-                  f"Open-market sells: {insider_data.get('open_sell_count', insider_data['sell_count'])}",
-                  f"Net shares: {insider_data['net_shares']:,}", "Recent:"]
-        for t in insider_data["transactions"][:5]:
-            lines.append(f"  - {t['Date']} | {t['Name']} | {t['Type']} | {t['Shares']} @ {t['Price']}")
-    lines += ["", "---",
-              "Reminder: For paper trading and educational research only. Not financial advice."]
-    return "\n".join(lines)
-
-# ── OpenAI helpers ────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = (
-    "You are an AI research assistant helping with paper trading education. "
-    "Never say buy or sell. Never predict prices. Use hedged language always: "
-    "'signals suggest', 'may indicate', 'historically'. "
-    "End every response with: This analysis is for paper trading and educational research only. "
-    "Not financial advice."
-)
-
-def generate_ai_analysis(ticker, latest, score, sentiment_data=None, insider_data=None):
-    s_block = ""
-    if sentiment_data:
-        headlines = "\n".join([
-            f"  - [{a['sentiment']}] {a['title']} — {a.get('summary','')[:150]}"
-            for a in sentiment_data.get("top_articles", [])
-        ])
-        s_block = f"\nNews Sentiment: {sentiment_data['sentiment_label']} (score {sentiment_data['avg_score']})\nHeadlines:\n{headlines}\n"
-    i_block = ""
-    if insider_data:
-        i_block = (f"\nPublic Insider Disclosures (90 days): {insider_data['insider_signal']}\n"
-                   f"Open-mkt buys: {insider_data.get('open_buy_count', insider_data['buy_count'])} | "
-                   f"Open-mkt sells: {insider_data.get('open_sell_count', insider_data['sell_count'])}\n"
-                   f"Net shares: {insider_data['net_shares']:,}\n")
-    prompt = f"""Analyze for paper trading research: {ticker}
-Close: ${safe_float(latest['Close']):.2f} | RSI: {safe_float(latest['RSI']):.1f}
-MA20: ${safe_float(latest['MA20']):.2f} | MA50: ${safe_float(latest['MA50']):.2f}
-Volume: {safe_float(latest['Volume']):.0f} | Research Score: {score}/100
-{s_block}{i_block}
-Return: 1) Technical setup assessment 2) MA trend 3) RSI reading
-4) Volume conviction 5) News signals (if available) 6) Insider signals (if available)
-7) One thing to watch next. Hedged language throughout."""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                  {"role": "user",   "content": prompt}],
-        temperature=0.3, max_tokens=600
-    )
-    return resp.choices[0].message.content
-
-def analyze_articles_with_ai(ticker, articles):
-    article_text = "\n".join([
-        f"Title: {a['title']}\nSource: {a['source']} | {a['sentiment']}\n"
-        f"Summary: {a.get('summary','')[:300]}\nURL: {a['url']}"
-        for a in articles
-    ])
-    prompt = f"""Analyze these public news articles for {ticker} (paper trading research only).
-{article_text}
-Return: 1) Bullish factors 2) Bearish risks 3) Neutral points
-4) Possible market impact 5) What to watch next. No buy/sell. Hedged language."""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                  {"role": "user",   "content": prompt}],
-        temperature=0.3, max_tokens=600
-    )
-    return resp.choices[0].message.content
-
-# ── UI helpers ────────────────────────────────────────────────────────────────
-def render_request_gate(api_name, limit, ticker, label, key_prefix):
-    used = get_usage_today(api_name)
-    rem  = requests_remaining(api_name, limit)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Remaining", f"{rem}/{limit}")
-    c2.metric("Used Today", str(used))
-    c3.metric("This call", "1 request")
-    st.progress(min(used / limit, 1.0))
-    if rem <= 0:
-        st.error(f"No {label} requests left today. Resets at midnight.")
-        return False
-    if rem <= 5:  st.error(f"Only {rem} {label} requests left!")
-    elif rem <= 10: st.warning(f"{rem} {label} requests left today")
-    st.info(f"Fetching **{label}** for **{ticker}** costs 1 request ({rem-1} after).")
-    return st.button(f"Confirm — fetch {label} for {ticker}", key=f"{key_prefix}_confirm")
-
-def render_openai_gate(key_prefix, label):
-    used = get_usage_today("openai")
-    rem  = requests_remaining("openai", OPENAI_DAILY_LIMIT)
-    st.caption(f"OpenAI: {used} used / {rem} remaining today (limit: {OPENAI_DAILY_LIMIT})")
-    if rem <= 0:
-        st.error("Hit your self-set OpenAI limit for today.")
-        return False
-    if rem <= 3: st.error(f"Only {rem} OpenAI calls left!")
-    return st.button(f"Use OpenAI — {label} (1 call + tokens)", key=key_prefix)
+# ── Cached market scan wrapper ────────────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def cached_market_sentiment_scan():
+    return fetch_market_sentiment_scan(alpha_key, increment_usage)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Watchlist Overview",
     "Deep Dive + Phase 2",
     "Backtesting",
     "Stock Discovery",
-    "Paper Trade Log"
+    "Market Sentiment Scanner",
+    "Public Disclosures",
+    "Paper Trade Log",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -640,7 +173,11 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.subheader("Watchlist Summary")
-    st.caption("Research scores are educational metrics only. Higher score = more bullish technical alignment. Not a trade recommendation.")
+    st.caption(
+        "Research scores are educational metrics only. "
+        "Higher score = more bullish technical alignment. Not a trade recommendation."
+    )
+
     summary_rows = []
     all_data     = {}
 
@@ -653,26 +190,27 @@ with tab1:
         latest   = data.iloc[-1]
         score, _ = score_stock(data)
         summary_rows.append({
-            "Ticker": ticker,
-            "Close":  f"${safe_float(latest['Close']):.2f}",
-            "RSI":    f"{safe_float(latest['RSI']):.1f}",
-            "MA20":   f"${safe_float(latest['MA20']):.2f}",
-            "MA50":   f"${safe_float(latest['MA50']):.2f}",
-            "Research Score": f"{score}/100",
-            "Signal Alignment": get_signal_short(score)
+            "Ticker":           ticker,
+            "Close":            f"${safe_float(latest['Close']):.2f}",
+            "RSI":              f"{safe_float(latest['RSI']):.1f}",
+            "MA20":             f"${safe_float(latest['MA20']):.2f}",
+            "MA50":             f"${safe_float(latest['MA50']):.2f}",
+            "Research Score":   f"{score}/100",
+            "Signal Alignment": get_signal_short(score),
         })
 
     if summary_rows:
         sdf = pd.DataFrame(summary_rows)
-        sdf["_s"] = sdf["Research Score"].str.replace("/100","").astype(int)
+        sdf["_s"] = sdf["Research Score"].str.replace("/100", "").astype(int)
         sdf = sdf.sort_values("_s", ascending=False).drop(columns=["_s"])
         st.dataframe(sdf, use_container_width=True, hide_index=True)
-    st.caption(DISCLAIMER)
+    render_disclaimer(DISCLAIMER)
     st.divider()
 
     for ticker in tickers:
         if ticker not in all_data:
             st.error(f"No data for {ticker}"); continue
+
         data   = all_data[ticker]
         latest = data.iloc[-1]
         score, reasons = score_stock(data)
@@ -684,35 +222,40 @@ with tab1:
         c2.metric("RSI",            f"{safe_float(latest['RSI']):.1f}")
         c3.metric("Volume",         f"{safe_float(latest['Volume']):,.0f}")
         c4.metric("Research Score", f"{score}/100")
-
-        if score >= 70:   st.success(f"Signal alignment: {signal}")
-        elif score >= 50: st.info(f"Signal alignment: {signal}")
-        else:             st.warning(f"Signal alignment: {signal}")
+        render_signal_banner(score, signal)
 
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=data.index, open=data["Open"], high=data["High"],
-                                     low=data["Low"], close=data["Close"], name="Price"))
-        fig.add_trace(go.Scatter(x=data.index, y=data["MA20"], name="MA20", line=dict(color="orange")))
-        fig.add_trace(go.Scatter(x=data.index, y=data["MA50"], name="MA50", line=dict(color="royalblue")))
-        fig.update_layout(height=400, xaxis_rangeslider_visible=False,
-                          title=f"{ticker} — {period} (data may be delayed ~15 min)")
+        fig.add_trace(go.Candlestick(
+            x=data.index, open=data["Open"], high=data["High"],
+            low=data["Low"], close=data["Close"], name="Price"
+        ))
+        fig.add_trace(go.Scatter(x=data.index, y=data["MA20"], name="MA20"))
+        fig.add_trace(go.Scatter(x=data.index, y=data["MA50"], name="MA50"))
+        fig.update_layout(
+            height=400, xaxis_rangeslider_visible=False,
+            title=f"{ticker} — {period} (data may be delayed ~15 min)"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("Score breakdown (research signals only)"):
-            st.caption("Educational indicators only. Do not predict future performance.")
-            for r in reasons: st.write(f"• {r}")
-            st.caption(DISCLAIMER)
+        render_score_breakdown(reasons, DISCLAIMER)
 
         with st.expander("AI Research Summary (uses OpenAI API)"):
             if client is None:
                 st.warning("Add OPENAI_API_KEY to Streamlit Secrets.")
             else:
-                st.caption("AI summaries are for research only. AI is instructed not to recommend trades.")
-                if render_openai_gate(f"ai_{ticker}", f"Generate summary for {ticker}"):
+                st.caption("AI summaries are for research only.")
+                if render_openai_gate(
+                    f"ai_{ticker}",
+                    f"Generate summary for {ticker}",
+                    OPENAI_DAILY_LIMIT,
+                    get_usage_today,
+                    requests_remaining,
+                ):
                     increment_usage("openai", 1)
                     with st.spinner(f"Generating summary for {ticker}..."):
-                        st.write(generate_ai_analysis(ticker, latest, score))
-                    st.caption(DISCLAIMER)
+                        st.write(generate_ai_analysis(client, ticker, latest, score))
+                    render_disclaimer(DISCLAIMER)
+
         st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -720,7 +263,9 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.subheader("Phase 2 Signal Alignment Summary")
-    st.caption("All data from public APIs. Insider data = public SEC filings only. For research only.")
+    st.caption(
+        "All data from public APIs. Insider data = public SEC filings only. For research only."
+    )
 
     p2_rows = []
     for ticker in tickers:
@@ -728,29 +273,33 @@ with tab2:
         if raw.empty: continue
         data = add_indicators(raw.copy())
         if data.empty: continue
-        cs = load_news_cache(ticker)   or st.session_state.get(f"sentiment_{ticker}")
-        ci = load_insider_cache(ticker) or st.session_state.get(f"insider_{ticker}")
-        sl = cs["sentiment_label"]    if cs else "Not fetched"
-        is_ = ci["insider_signal"]   if ci else "Not fetched"
+        cs  = load_news_cache(ticker)    or st.session_state.get(f"sentiment_{ticker}")
+        ci  = load_insider_cache(ticker) or st.session_state.get(f"insider_{ticker}")
+        sl  = cs["sentiment_label"] if cs else "Not fetched"
+        is_ = ci["insider_signal"]  if ci else "Not fetched"
         ts, _ = score_stock(data)
-        comb, _ = score_stock(data,
-                              news_sentiment=cs,
-                              insider_signal=is_ if is_ not in ["Not fetched","—"] else None)
-        p2_rows.append({"Ticker": ticker, "Tech Score": f"{ts}/100",
-                        "News Sentiment": sl, "Insider Disclosure": is_,
-                        "Combined Score": f"{comb}/100",
-                        "Signal Alignment": get_signal_short(comb)})
+        comb, _ = score_stock(
+            data, news_sentiment=cs,
+            insider_signal=is_ if is_ not in ["Not fetched", "—"] else None
+        )
+        p2_rows.append({
+            "Ticker":             ticker,
+            "Tech Score":         f"{ts}/100",
+            "News Sentiment":     sl,
+            "Insider Disclosure": is_,
+            "Combined Score":     f"{comb}/100",
+            "Signal Alignment":   get_signal_short(comb),
+        })
 
     if p2_rows:
         p2df = pd.DataFrame(p2_rows)
-        p2df["_s"] = p2df["Combined Score"].str.replace("/100","").astype(int)
+        p2df["_s"] = p2df["Combined Score"].str.replace("/100", "").astype(int)
         p2df = p2df.sort_values("_s", ascending=False).drop(columns=["_s"])
         st.dataframe(p2df, use_container_width=True, hide_index=True)
-    st.caption(DISCLAIMER)
+    render_disclaimer(DISCLAIMER)
     st.divider()
 
     st.subheader(f"Deep Dive: {selected}")
-    st.caption(f"Publicly available research data for {selected}. Price may be delayed ~15 min.")
     raw = get_data(selected, period)
 
     if raw.empty:
@@ -769,26 +318,23 @@ with tab2:
         c2.metric("Signal Alignment", get_signal_short(score))
         c3.metric("RSI",              f"{safe_float(latest['RSI']):.1f}")
         c4.metric("Close",            f"${safe_float(latest['Close']):.2f}")
-
-        if score >= 70:   st.success(f"Signal alignment: {signal}")
-        elif score >= 50: st.info(f"Signal alignment: {signal}")
-        else:             st.warning(f"Signal alignment: {signal}")
+        render_signal_banner(score, signal)
 
         fig2 = go.Figure()
-        fig2.add_trace(go.Candlestick(x=data.index, open=data["Open"], high=data["High"],
-                                      low=data["Low"], close=data["Close"], name="Price"))
-        fig2.add_trace(go.Scatter(x=data.index, y=data["MA20"], name="MA20", line=dict(color="orange")))
-        fig2.add_trace(go.Scatter(x=data.index, y=data["MA50"], name="MA50", line=dict(color="royalblue")))
-        fig2.update_layout(height=500, xaxis_rangeslider_visible=False,
-                           title=f"{selected} — Deep Dive (data may be delayed ~15 min)")
+        fig2.add_trace(go.Candlestick(
+            x=data.index, open=data["Open"], high=data["High"],
+            low=data["Low"], close=data["Close"], name="Price"
+        ))
+        fig2.add_trace(go.Scatter(x=data.index, y=data["MA20"], name="MA20"))
+        fig2.add_trace(go.Scatter(x=data.index, y=data["MA50"], name="MA50"))
+        fig2.update_layout(
+            height=500, xaxis_rangeslider_visible=False,
+            title=f"{selected} — Deep Dive (data may be delayed ~15 min)"
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
-        with st.expander("Score breakdown (research signals only)"):
-            st.caption("Educational signal indicators only. Do not predict future performance.")
-            for r in reasons: st.write(f"• {r}")
-            st.caption(DISCLAIMER)
+        render_score_breakdown(reasons, DISCLAIMER)
 
-        # ── Phase 3 Prompt 2: Auto-save snapshot ─────────────────────────────
         snap_result = save_signal_snapshot(
             ticker               = selected,
             close                = safe_float(latest["Close"]),
@@ -800,23 +346,25 @@ with tab2:
             news_sentiment_label = cs["sentiment_label"] if cs else None,
             insider_signal       = isig,
             combined_score       = score,
-            final_signal         = get_signal_short(score)
+            final_signal         = get_signal_short(score),
         )
-        if snap_result == "saved":
-            st.success(f"📸 Today's signal snapshot saved for {selected}.")
-        else:
-            st.caption(f"📸 Snapshot for {selected} already exists for today.")
+        render_snapshot_status(snap_result, selected)
 
         # ── News sentiment ────────────────────────────────────────────────────
         with st.expander("News Sentiment — Alpha Vantage (public news data)", expanded=False):
-            st.caption("Derived from publicly available news articles. Does not predict price movement.")
+            st.caption("Derived from publicly available articles. Does not predict price movement.")
             if not alpha_key:
                 st.warning("Add ALPHA_VANTAGE_API_KEY to Streamlit Secrets.")
             else:
-                if render_request_gate("alpha_vantage", AV_DAILY_LIMIT, selected, "Alpha Vantage", f"av_{selected}"):
-                    with st.spinner(f"Fetching public news sentiment for {selected}..."):
-                        result, err = fetch_news_sentiment(selected)
-                    if err: st.error(f"Could not load sentiment: {err}")
+                if render_request_gate(
+                    "alpha_vantage", AV_DAILY_LIMIT, selected,
+                    "Alpha Vantage", f"av_{selected}",
+                    get_usage_today, requests_remaining,
+                ):
+                    with st.spinner(f"Fetching news sentiment for {selected}..."):
+                        result, err = fetch_news_sentiment(selected, alpha_key, increment_usage)
+                    if err:
+                        st.error(f"Could not load sentiment: {err}")
                     else:
                         save_news_cache(selected, result)
                         st.session_state[f"sentiment_{selected}"] = result
@@ -828,50 +376,71 @@ with tab2:
                     s1.metric("Sentiment Lean",  cached["sentiment_label"])
                     s2.metric("Avg Score",       cached["avg_score"])
                     s3.metric("Articles Found",  cached["article_count"])
-                    if cached["sentiment_label"] == "Bullish":
-                        st.success("News sentiment leaning bullish — signals may be favorable")
-                    elif cached["sentiment_label"] == "Bearish":
-                        st.error("News sentiment leaning bearish — signals may be unfavorable")
-                    else:
-                        st.info("News sentiment neutral — no strong directional signal")
+                    render_sentiment_banner(cached["sentiment_label"])
+
                     st.markdown("**Top recent public headlines:**")
                     for a in cached["top_articles"][:3]:
                         t = a["time"]
-                        if len(t) == 8: t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
-                        st.markdown(f"- [{a['title']}]({a['url']})  \n  *{a['source']} · {t} · {a['sentiment']}*")
+                        if len(t) == 8:
+                            t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
+                        st.markdown(
+                            f"- [{a['title']}]({a['url']})  \n"
+                            f"  *{a['source']} · {t} · {a['sentiment']}*"
+                        )
 
                     st.divider()
                     if client:
-                        st.markdown("**Analyze articles with AI (uses OpenAI API)**")
-                        st.caption("AI summarizes bullish/bearish factors from headlines. Research only.")
-                        if render_openai_gate(f"analyze_articles_{selected}", "Analyze News Articles"):
+                        st.markdown("**Analyze articles with AI**")
+                        if render_openai_gate(
+                            f"analyze_articles_{selected}",
+                            "Analyze News Articles",
+                            OPENAI_DAILY_LIMIT,
+                            get_usage_today,
+                            requests_remaining,
+                        ):
                             increment_usage("openai", 1)
                             with st.spinner("Analyzing articles..."):
-                                st.write(analyze_articles_with_ai(selected, cached["top_articles"]))
-                            st.caption(DISCLAIMER)
+                                st.write(analyze_articles_with_ai(
+                                    client, selected, cached["top_articles"]
+                                ))
+                            render_disclaimer(DISCLAIMER)
 
                     st.divider()
-                    st.markdown("**Use ChatGPT instead — free, same results**")
+                    st.markdown("**Use ChatGPT instead — free**")
                     st.caption("Copy → paste into chatgpt.com. No API cost.")
-                    st.code(build_chatgpt_prompt(selected, latest, score, reasons,
-                                                  sentiment_data=cached,
-                                                  insider_data=load_insider_cache(selected) or
-                                                  st.session_state.get(f"insider_{selected}")),
-                            language="")
+                    st.code(build_chatgpt_prompt(
+                        selected, latest, score, reasons,
+                        sentiment_data=cached,
+                        insider_data=load_insider_cache(selected) or
+                                     st.session_state.get(f"insider_{selected}"),
+                    ), language="")
                 else:
-                    st.caption("No sentiment data loaded yet. Confirm above to fetch.")
+                    st.caption("No sentiment data yet. Confirm above to fetch.")
 
         # ── Insider activity ──────────────────────────────────────────────────
-        with st.expander("Insider Disclosure Activity — Finnhub (public SEC filings only)", expanded=False):
-            st.caption("All data from public regulatory disclosures (SEC Form 4). Not non-public information. "
-                       "Insider selling is often routine. Open-market buying is generally a stronger signal.")
+        with st.expander(
+            "Insider Disclosure Activity — Finnhub (public SEC filings only)",
+            expanded=False
+        ):
+            st.caption(
+                "All data from public regulatory disclosures (SEC Form 4). "
+                "Selling is often routine. Open-market buying is generally a stronger signal."
+            )
             if not finnhub_key:
                 st.warning("Add FINNHUB_API_KEY to Streamlit Secrets.")
             else:
-                if render_request_gate("finnhub", FINNHUB_DAILY_LIMIT, selected, "Finnhub", f"fh_{selected}"):
-                    with st.spinner(f"Fetching public insider disclosures for {selected}..."):
-                        ir, ie = fetch_insider_transactions(selected)
-                    if ie: st.error(f"Could not load insider data: {ie}")
+                if render_request_gate(
+                    "finnhub", FINNHUB_DAILY_LIMIT, selected,
+                    "Finnhub", f"fh_{selected}",
+                    get_usage_today, requests_remaining,
+                ):
+                    with st.spinner(f"Fetching insider disclosures for {selected}..."):
+                        from modules.insider_api import fetch_insider_transactions
+                        ir, ie = fetch_insider_transactions(
+                            selected, finnhub_key, increment_usage
+                        )
+                    if ie:
+                        st.error(f"Could not load insider data: {ie}")
                     else:
                         save_insider_cache(selected, ir)
                         st.session_state[f"insider_{selected}"] = ir
@@ -883,45 +452,56 @@ with tab2:
                     i1.metric("Disclosure Signal", ci2["insider_signal"])
                     i2.metric("Open-Mkt Buys",     ci2.get("open_buy_count",  ci2["buy_count"]))
                     i3.metric("Open-Mkt Sells",     ci2.get("open_sell_count", ci2["sell_count"]))
-                    net = ci2["net_shares"]
-                    if ci2["insider_signal"] == "Bullish":
-                        st.success(f"Open-market insider buying — net {net:,} shares. Potentially positive signal.")
-                    elif ci2["insider_signal"] == "Bearish":
-                        st.warning(f"Net insider selling — {net:,} shares. Often routine or planned.")
-                    else:
-                        st.info(f"Mixed or neutral insider activity. Net shares: {net:,}")
-                    st.caption("Open-Market Buy = strongest. Grant/Award = compensation. Planned Sell = often pre-scheduled.")
+                    render_insider_banner(ci2["insider_signal"], ci2["net_shares"])
+                    st.caption(
+                        "Open-Market Buy = strongest signal. "
+                        "Grant = compensation. Planned Sell = often pre-scheduled."
+                    )
                     if ci2["transactions"]:
-                        st.dataframe(pd.DataFrame(ci2["transactions"]), use_container_width=True, hide_index=True)
-                    st.caption(DISCLAIMER)
+                        st.dataframe(
+                            pd.DataFrame(ci2["transactions"]),
+                            use_container_width=True, hide_index=True
+                        )
+                    render_disclaimer(DISCLAIMER)
                 else:
-                    st.caption("No insider data loaded yet. Confirm above to fetch.")
+                    st.caption("No insider data yet. Confirm above to fetch.")
 
-        # ── AI Summary ───────────────────────────────────────────────────────
+        # ── AI Summary ────────────────────────────────────────────────────────
         st.subheader("AI Research Summary")
-        st.caption("AI summaries are for paper trading research only. AI uses hedged language and never recommends trades.")
+        st.caption("AI summaries are for paper trading research only.")
         st.markdown("**Option 1 — Free: Copy prompt → paste into chatgpt.com**")
-        st.caption("No API cost. Same research quality.")
-        st.code(build_chatgpt_prompt(selected, latest, score, reasons,
-                                      sentiment_data=cs, insider_data=ci), language="")
+        st.code(build_chatgpt_prompt(
+            selected, latest, score, reasons,
+            sentiment_data=cs, insider_data=ci,
+        ), language="")
+
         st.markdown("**Option 2 — Use OpenAI API (costs tokens)**")
         if client is None:
             st.warning("Add OPENAI_API_KEY to Streamlit Secrets.")
-        elif render_openai_gate("ai_deepdive", f"Generate AI summary for {selected}"):
+        elif render_openai_gate(
+            "ai_deepdive",
+            f"Generate AI summary for {selected}",
+            OPENAI_DAILY_LIMIT,
+            get_usage_today,
+            requests_remaining,
+        ):
             increment_usage("openai", 1)
             with st.spinner("Generating research summary..."):
-                st.info(generate_ai_analysis(selected, latest, score, sentiment_data=cs, insider_data=ci))
-            st.caption(DISCLAIMER)
+                st.info(generate_ai_analysis(
+                    client, selected, latest, score,
+                    sentiment_data=cs, insider_data=ci,
+                ))
+            render_disclaimer(DISCLAIMER)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Backtesting (Prompts 3 + 4)
+# TAB 3 — Backtesting
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
     st.subheader("Signal Backtesting")
     st.info(
         "⚠️ **Backtesting disclaimer:** Past signal performance does not guarantee future results. "
         "Returns shown are hypothetical and based on signal snapshots vs current price. "
-        "This is for educational research only. Not financial advice."
+        "For educational research only. Not financial advice."
     )
 
     history_df = load_signal_history()
@@ -929,39 +509,38 @@ with tab3:
     if history_df.empty:
         st.info("No signal history yet. Visit the Deep Dive tab to start saving daily snapshots.")
     else:
-        # Calculate returns
         rows = []
         for _, row in history_df.iterrows():
             current = get_current_price(row["ticker"])
             if current and row["close"] > 0:
-                ret_pct   = ((current - row["close"]) / row["close"]) * 100
+                ret_pct    = ((current - row["close"]) / row["close"]) * 100
                 profitable = ret_pct > 0
             else:
-                ret_pct   = None
-                profitable = None
+                ret_pct = None; profitable = None
             try:
-                snap_date = datetime.strptime(row["snapshot_date"], "%Y-%m-%d").date()
-                days_held = (date.today() - snap_date).days
+                days_held = (
+                    date.today() -
+                    datetime.strptime(row["snapshot_date"], "%Y-%m-%d").date()
+                ).days
             except:
                 days_held = 0
             rows.append({
-                "Ticker":         row["ticker"],
-                "Snapshot Date":  row["snapshot_date"],
-                "Signal":         row["final_signal"],
-                "Score@Snap":     row["combined_score"],
-                "Close@Snap":     row["close"],
-                "Current Price":  current,
-                "Return %":       round(ret_pct, 2) if ret_pct is not None else None,
-                "Days Held":      days_held,
-                "Profitable":     profitable,
-                "News@Snap":      row["news_sentiment_label"],
-                "Insider@Snap":   row["insider_signal"],
+                "Ticker":        row["ticker"],
+                "Snapshot Date": row["snapshot_date"],
+                "Signal":        row["final_signal"],
+                "Score@Snap":    row["combined_score"],
+                "Close@Snap":    row["close"],
+                "Current Price": current,
+                "Return %":      round(ret_pct, 2) if ret_pct is not None else None,
+                "Days Held":     days_held,
+                "Profitable":    profitable,
+                "News@Snap":     row["news_sentiment_label"],
+                "Insider@Snap":  row["insider_signal"],
             })
 
         bt_df = pd.DataFrame(rows)
         valid = bt_df.dropna(subset=["Return %"])
 
-        # ── Summary metrics ───────────────────────────────────────────────────
         st.subheader("Overall Backtest Summary")
         st.caption("Hypothetical returns based on snapshot close vs current price. Educational only.")
 
@@ -970,108 +549,111 @@ with tab3:
             avg_return = valid["Return %"].mean()
             best       = valid.loc[valid["Return %"].idxmax()]
             worst      = valid.loc[valid["Return %"].idxmin()]
-
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Win Rate",       f"{win_rate:.1f}%")
-            m2.metric("Avg Return",     f"{avg_return:+.2f}%")
-            m3.metric("Best Signal",    f"{best['Ticker']} {best['Return %']:+.2f}%")
-            m4.metric("Worst Signal",   f"{worst['Ticker']} {worst['Return %']:+.2f}%")
-
-            st.markdown("**Average return by signal type:**")
-            st.caption("Do bullish signals historically outperform neutral or weak ones in your research?")
-            sig_avg = (valid.groupby("Signal")["Return %"]
-                       .agg(["mean", "count"])
-                       .reset_index()
-                       .rename(columns={"mean": "Avg Return %", "count": "# Signals"}))
+            m1.metric("Win Rate",     f"{win_rate:.1f}%")
+            m2.metric("Avg Return",   f"{avg_return:+.2f}%")
+            m3.metric("Best Signal",  f"{best['Ticker']} {best['Return %']:+.2f}%")
+            m4.metric("Worst Signal", f"{worst['Ticker']} {worst['Return %']:+.2f}%")
+            sig_avg = (
+                valid.groupby("Signal")["Return %"]
+                .agg(["mean", "count"]).reset_index()
+                .rename(columns={"mean": "Avg Return %", "count": "# Signals"})
+            )
             sig_avg["Avg Return %"] = sig_avg["Avg Return %"].round(2)
             st.dataframe(sig_avg, use_container_width=True, hide_index=True)
 
-        st.subheader("Full Signal History")
         display_df = bt_df.copy()
-        display_df["Return %"] = display_df["Return %"].apply(
+        display_df["Return %"]      = display_df["Return %"].apply(
             lambda x: f"{x:+.2f}%" if x is not None else "Pending"
         )
         display_df["Current Price"] = display_df["Current Price"].apply(
             lambda x: f"${x:.2f}" if x else "N/A"
         )
         display_df["Close@Snap"] = display_df["Close@Snap"].apply(lambda x: f"${x:.2f}")
-        st.dataframe(display_df.drop(columns=["Profitable"]),
-                     use_container_width=True, hide_index=True)
-        st.caption(DISCLAIMER)
+        st.dataframe(
+            display_df.drop(columns=["Profitable"]),
+            use_container_width=True, hide_index=True
+        )
+        render_disclaimer(DISCLAIMER)
 
-        # ── Prompt 4: Backtesting visuals ─────────────────────────────────────
         if not valid.empty:
             st.divider()
             st.subheader("Backtest Charts")
-            st.caption("All charts are educational. Based on limited historical snapshots — interpret carefully.")
+            st.caption("Educational only. Based on limited snapshots — interpret carefully.")
 
-            # Chart 1: Avg return by score range
             st.markdown("**Average return by research score range**")
-            st.caption("Do higher research scores correlate with better hypothetical returns in your data?")
+            st.caption("Do higher research scores correlate with better hypothetical returns?")
             valid2 = valid.copy()
             valid2["Score Range"] = pd.cut(
-                valid2["Score@Snap"],
-                bins=[0, 40, 55, 70, 100],
-                labels=["0–40 (Weak)", "41–55 (Neutral-Low)", "56–70 (Neutral-High)", "71–100 (Bullish)"]
+                valid2["Score@Snap"], bins=[0, 40, 55, 70, 100],
+                labels=["0–40 (Weak)", "41–55 (Neutral-Low)",
+                        "56–70 (Neutral-High)", "71–100 (Bullish)"]
             )
-            sr_avg = valid2.groupby("Score Range", observed=True)["Return %"].mean().reset_index()
-            fig_sr = px.bar(sr_avg, x="Score Range", y="Return %",
-                            title="Avg Hypothetical Return by Score Range",
-                            color="Return %", color_continuous_scale="RdYlGn")
+            sr_avg = valid2.groupby(
+                "Score Range", observed=True
+            )["Return %"].mean().reset_index()
+            fig_sr = px.bar(
+                sr_avg, x="Score Range", y="Return %",
+                title="Avg Hypothetical Return by Score Range",
+                color="Return %", color_continuous_scale="RdYlGn"
+            )
             fig_sr.update_layout(height=350)
             st.plotly_chart(fig_sr, use_container_width=True)
 
-            # Chart 2: Win rate by signal type
             st.markdown("**Win rate by signal type**")
-            st.caption("What percentage of each signal type resulted in a positive hypothetical return?")
-            wr_sig = (valid.groupby("Signal")["Profitable"]
-                      .agg(lambda x: x.mean() * 100)
-                      .reset_index()
-                      .rename(columns={"Profitable": "Win Rate %"}))
-            fig_wr = px.bar(wr_sig, x="Signal", y="Win Rate %",
-                            title="Win Rate % by Signal Type",
-                            color="Signal",
-                            color_discrete_map={"Bullish": "green", "Neutral": "gold", "Weak": "red"})
+            st.caption("What percentage of each signal type resulted in a positive return?")
+            wr_sig = (
+                valid.groupby("Signal")["Profitable"]
+                .agg(lambda x: x.mean() * 100).reset_index()
+                .rename(columns={"Profitable": "Win Rate %"})
+            )
+            fig_wr = px.bar(
+                wr_sig, x="Signal", y="Win Rate %",
+                title="Win Rate % by Signal Type", color="Signal",
+                color_discrete_map={"Bullish": "green", "Neutral": "gold", "Weak": "red"}
+            )
             fig_wr.update_layout(height=350)
             st.plotly_chart(fig_wr, use_container_width=True)
 
-            # Chart 3: Signal distribution
             st.markdown("**Distribution of signals saved**")
             st.caption("How many of your saved snapshots were Bullish, Neutral, or Weak?")
             sig_dist = bt_df["Signal"].value_counts().reset_index()
             sig_dist.columns = ["Signal", "Count"]
-            fig_dist = px.pie(sig_dist, names="Signal", values="Count",
-                              title="Signal Distribution",
-                              color="Signal",
-                              color_discrete_map={"Bullish": "green", "Neutral": "gold", "Weak": "red"})
+            fig_dist = px.pie(
+                sig_dist, names="Signal", values="Count",
+                title="Signal Distribution", color="Signal",
+                color_discrete_map={"Bullish": "green", "Neutral": "gold", "Weak": "red"}
+            )
             st.plotly_chart(fig_dist, use_container_width=True)
 
-            # Chart 4 + 5: Top and worst performers
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown("**Top performing tickers**")
-                st.caption("Tickers with the highest hypothetical returns since snapshot.")
+                st.caption("Highest hypothetical returns since snapshot.")
                 top5 = valid.nlargest(5, "Return %")[["Ticker", "Signal", "Return %"]]
-                fig_top = px.bar(top5, x="Ticker", y="Return %",
-                                 color="Return %", color_continuous_scale="Greens",
-                                 title="Top 5 Hypothetical Returns")
+                fig_top = px.bar(
+                    top5, x="Ticker", y="Return %",
+                    color="Return %", color_continuous_scale="Greens",
+                    title="Top 5 Hypothetical Returns"
+                )
                 fig_top.update_layout(height=300)
                 st.plotly_chart(fig_top, use_container_width=True)
-
             with col_b:
                 st.markdown("**Worst performing tickers**")
-                st.caption("Tickers with the lowest hypothetical returns since snapshot.")
+                st.caption("Lowest hypothetical returns since snapshot.")
                 bot5 = valid.nsmallest(5, "Return %")[["Ticker", "Signal", "Return %"]]
-                fig_bot = px.bar(bot5, x="Ticker", y="Return %",
-                                 color="Return %", color_continuous_scale="Reds_r",
-                                 title="Bottom 5 Hypothetical Returns")
+                fig_bot = px.bar(
+                    bot5, x="Ticker", y="Return %",
+                    color="Return %", color_continuous_scale="Reds_r",
+                    title="Bottom 5 Hypothetical Returns"
+                )
                 fig_bot.update_layout(height=300)
                 st.plotly_chart(fig_bot, use_container_width=True)
 
-            st.caption(DISCLAIMER)
+            render_disclaimer(DISCLAIMER)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Stock Discovery (Prompts 5 + 6)
+# TAB 4 — Stock Discovery
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab4:
     st.subheader("Stock Discovery Scanner")
@@ -1082,127 +664,465 @@ with tab4:
         "For educational research only. Not financial advice."
     )
 
-    category = st.selectbox("Choose a category to scan", list(DISCOVERY_LISTS.keys()))
-    scan_tickers = DISCOVERY_LISTS[category]
-
-    st.caption(f"Scanning {len(scan_tickers)} tickers in **{category}**: {', '.join(scan_tickers)}")
-    st.caption("Uses yfinance only. No paid API calls.")
+    category     = st.selectbox("Choose a category to scan", get_category_names())
+    scan_tickers = get_category_tickers(category)
+    st.caption(
+        f"Scanning {len(scan_tickers)} tickers in **{category}**: {', '.join(scan_tickers)}"
+    )
 
     if st.button(f"Scan {category}", key="run_scan"):
-        scan_rows = []
-        prog = st.progress(0)
-        status_text = st.empty()
+        prog          = st.progress(0)
+        status_text   = st.empty()
+        partial_results = []
 
         for i, ticker in enumerate(scan_tickers):
             status_text.caption(f"Scanning {ticker} ({i+1}/{len(scan_tickers)})...")
             prog.progress((i + 1) / len(scan_tickers))
-            try:
-                raw = get_data(ticker, "3mo")
-                if raw.empty: continue
-                data = add_indicators(raw.copy())
-                if data.empty: continue
-                latest = data.iloc[-1]
-                score, reasons = score_stock(data)
-                signal = get_signal_short(score)
-                top_reason = reasons[0] if reasons else "—"
-                scan_rows.append({
-                    "Ticker":          ticker,
-                    "Close":           f"${safe_float(latest['Close']):.2f}",
-                    "RSI":             f"{safe_float(latest['RSI']):.1f}",
-                    "MA20":            f"${safe_float(latest['MA20']):.2f}",
-                    "MA50":            f"${safe_float(latest['MA50']):.2f}",
-                    "Volume":          f"{safe_float(latest['Volume']):,.0f}",
-                    "Research Score":  score,
-                    "Signal":          signal,
-                    "Top Signal":      top_reason,
+            result = get_quick_stats(
+                ticker, get_data, add_indicators,
+                score_stock, get_signal_short, safe_float
+            )
+            if result:
+                partial_results.append({
+                    "Ticker":         result["ticker"],
+                    "Close":          f"${result['close']:.2f}",
+                    "RSI":            f"{result['rsi']:.1f}",
+                    "MA20":           f"${safe_float(result['latest']['MA20']):.2f}",
+                    "MA50":           f"${safe_float(result['latest']['MA50']):.2f}",
+                    "Volume":         f"{safe_float(result['latest']['Volume']):,.0f}",
+                    "Research Score": result["score"],
+                    "Signal":         result["signal"],
+                    "Top Signal":     result["reasons"][0] if result["reasons"] else "—",
                 })
-            except Exception as e:
-                st.caption(f"Could not scan {ticker}: {e}")
 
         prog.empty()
         status_text.empty()
 
-        if scan_rows:
-            scan_df = pd.DataFrame(scan_rows).sort_values("Research Score", ascending=False)
-            scan_df["Research Score"] = scan_df["Research Score"].apply(lambda x: f"{x}/100")
-            st.session_state["scan_results"] = scan_rows
+        if partial_results:
+            st.session_state["scan_results"]  = partial_results
             st.session_state["scan_category"] = category
 
-    # Display results
     if "scan_results" in st.session_state:
-        scan_rows = st.session_state["scan_results"]
-        scan_df   = (pd.DataFrame(scan_rows)
-                     .sort_values("Research Score", ascending=False)
-                     .reset_index(drop=True))
+        scan_rows  = st.session_state["scan_results"]
+        scan_df    = pd.DataFrame(scan_rows).sort_values(
+            "Research Score", ascending=False
+        ).reset_index(drop=True)
+        display_df = build_display_df(scan_rows)
 
         st.subheader(f"Scan Results — {st.session_state.get('scan_category', category)}")
-        st.caption(
-            "Ranked by research score (highest = most technically aligned). "
-            "Score is an educational metric only. Not a recommendation."
-        )
-
-        display_df = scan_df.copy()
-        display_df["Research Score"] = display_df["Research Score"].apply(lambda x: f"{x}/100")
+        st.caption("Ranked by research score. Educational metric only. Not a trade recommendation.")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.caption(DISCLAIMER)
+        render_disclaimer(DISCLAIMER)
 
-        # ── Prompt 6: Send to Deep Dive ───────────────────────────────────────
         st.divider()
         st.subheader("Send a Candidate to Deep Dive")
-        st.caption(
-            "Select a ticker from the scan results to analyze further. "
-            "After selecting, go to the **Deep Dive + Phase 2** tab to run news sentiment, "
-            "insider activity, and AI summary manually."
-        )
-
-        candidate_tickers = scan_df["Ticker"].tolist()
-        chosen = st.selectbox("Select a ticker to investigate further", candidate_tickers)
-
+        st.caption("Select a ticker to investigate further. Then go to Deep Dive + Phase 2 tab.")
+        chosen   = st.selectbox("Select a ticker", scan_df["Ticker"].tolist())
         col_a, col_b = st.columns(2)
 
-        if col_a.button(f"Set {chosen} as Deep Dive ticker"):
-            current_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-            if chosen not in current_tickers:
-                new_input = tickers_input.rstrip(", ") + f", {chosen}"
-                st.success(
-                    f"**{chosen}** added to your watchlist. "
-                    f"Update the ticker input in the sidebar to: `{new_input}` "
-                    f"then select **{chosen}** in the Deep Dive dropdown."
-                )
+        if col_a.button(f"Add {chosen} to watchlist"):
+            current_list = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+            if chosen in current_list:
+                st.info(f"{chosen} is already in your watchlist.")
             else:
-                st.info(f"{chosen} is already in your watchlist. Select it in the Deep Dive tab.")
+                st.success(
+                    f"**{chosen}** ready to add. Update the sidebar ticker input to include it, "
+                    f"then select it in the Deep Dive dropdown."
+                )
 
-        if col_b.button(f"Show quick stats for {chosen}"):
-            raw = get_data(chosen, "3mo")
-            if not raw.empty:
-                data   = add_indicators(raw.copy())
-                latest = data.iloc[-1]
-                score, reasons = score_stock(data)
-                st.markdown(f"**{chosen} Quick Stats**")
+        if col_b.button(f"Quick stats for {chosen}"):
+            stats = get_quick_stats(
+                chosen, get_data, add_indicators,
+                score_stock, get_signal_short, safe_float
+            )
+            if stats:
                 q1, q2, q3, q4 = st.columns(4)
-                q1.metric("Close",          f"${safe_float(latest['Close']):.2f}")
-                q2.metric("RSI",            f"{safe_float(latest['RSI']):.1f}")
-                q3.metric("Research Score", f"{score}/100")
-                q4.metric("Signal",         get_signal_short(score))
-                st.markdown("Signal breakdown:")
-                for r in reasons: st.write(f"• {r}")
-                st.caption(DISCLAIMER)
+                q1.metric("Close",          f"${stats['close']:.2f}")
+                q2.metric("RSI",            f"{stats['rsi']:.1f}")
+                q3.metric("Research Score", f"{stats['score']}/100")
+                q4.metric("Signal",         stats["signal"])
+                for r in stats["reasons"]:
+                    st.write(f"• {r}")
+                render_disclaimer(DISCLAIMER)
+            else:
+                st.warning(f"Could not load data for {chosen}")
 
         st.info(
             f"**Next steps for {chosen}:**\n"
-            "1. Add it to your watchlist in the sidebar\n"
-            "2. Go to **Deep Dive + Phase 2** tab\n"
-            "3. Fetch news sentiment (costs 1 Alpha Vantage request)\n"
-            "4. Fetch insider disclosures (costs 1 Finnhub request)\n"
-            "5. Use the free ChatGPT prompt or OpenAI button for AI analysis\n"
-            "6. If setup looks interesting, log a paper trade in the Paper Trade Log tab\n\n"
+            "1. Add to watchlist in the sidebar\n"
+            "2. Go to Deep Dive + Phase 2 tab\n"
+            "3. Fetch news sentiment (1 Alpha Vantage request)\n"
+            "4. Fetch insider disclosures (1 Finnhub request)\n"
+            "5. Check SEC filings in Public Disclosures tab\n"
+            "6. Use free ChatGPT prompt or OpenAI button for AI analysis\n"
+            "7. Log a paper trade if the setup looks interesting\n\n"
             "⚠️ All analysis is for educational research only. Not financial advice."
         )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Paper Trade Log
+# TAB 5 — Market Sentiment Scanner
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab5:
+    st.subheader("Market Sentiment Scanner")
+    st.info(
+        "📡 This scanner fetches broad market news from Alpha Vantage without filtering by ticker. "
+        "It costs **exactly 1 Alpha Vantage request** and surfaces the top 15 most-mentioned "
+        "tickers from recent news, ranked by coverage and sentiment. "
+        "Use this to discover tickers you didn't know to look for. "
+        "For educational research only. Not financial advice."
+    )
+
+    av_rem  = requests_remaining("alpha_vantage", AV_DAILY_LIMIT)
+    av_used = get_usage_today("alpha_vantage")
+
+    sc1, sc2, sc3 = st.columns(3)
+    sc1.metric("Alpha Vantage Remaining", f"{av_rem} / {AV_DAILY_LIMIT}")
+    sc2.metric("Used Today",              str(av_used))
+    sc3.metric("This scan costs",         "1 request")
+    st.progress(min(av_used / AV_DAILY_LIMIT, 1.0))
+
+    if av_rem <= 0:
+        st.error("No Alpha Vantage requests left today. Resets at midnight.")
+    else:
+        if av_rem <= 5:
+            st.error(f"Only {av_rem} Alpha Vantage requests left — use carefully.")
+        elif av_rem <= 10:
+            st.warning(f"{av_rem} Alpha Vantage requests left today.")
+
+        st.caption(
+            "Fetches the 50 most recent market news articles and extracts every ticker mentioned. "
+            "Results are cached for 30 minutes — refreshing does not cost another request."
+        )
+
+        if st.button("Confirm — Run Market Sentiment Scan (1 request)", key="run_market_scan"):
+            with st.spinner("Scanning market news..."):
+                scan_results, scan_err = cached_market_sentiment_scan()
+            if scan_err:
+                st.error(f"Scan failed: {scan_err}")
+            else:
+                st.session_state["market_scan_results"] = scan_results
+                st.session_state["market_scan_time"]    = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if "market_scan_results" in st.session_state:
+        results   = st.session_state["market_scan_results"]
+        scan_time = st.session_state.get("market_scan_time", "unknown")
+
+        st.divider()
+        st.subheader(f"Top 15 Most-Covered Tickers — scanned {scan_time}")
+        st.caption(
+            "Ranked by article mentions then sentiment score. "
+            "Higher mentions = more news coverage. For research only — not a recommendation."
+        )
+
+        table_rows = []
+        for r in results:
+            t = r["Time"]
+            if len(t) == 8:
+                t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
+            table_rows.append({
+                "Ticker":        r["Ticker"],
+                "Mentions":      r["Mentions"],
+                "Avg Sentiment": r["Avg Sentiment"],
+                "Sentiment":     r["Sentiment"],
+                "Top Headline":  (
+                    r["Top Headline"][:80] + "..."
+                    if len(r["Top Headline"]) > 80
+                    else r["Top Headline"]
+                ),
+                "Source":        r["Source"],
+                "Latest":        t,
+            })
+
+        table_df = pd.DataFrame(table_rows)
+
+        def sentiment_color(val):
+            if val == "Bullish": return "color: green"
+            if val == "Bearish": return "color: red"
+            return "color: gray"
+
+        st.dataframe(
+            table_df.style.applymap(sentiment_color, subset=["Sentiment"]),
+            use_container_width=True, hide_index=True
+        )
+        render_disclaimer(DISCLAIMER)
+
+        st.divider()
+        st.subheader("Explore a Ticker from the Scan")
+        chosen_scan = st.selectbox(
+            "Select a ticker to explore",
+            [r["Ticker"] for r in results],
+            key="market_scan_chosen"
+        )
+
+        chosen_data = next((r for r in results if r["Ticker"] == chosen_scan), None)
+        if chosen_data:
+            st.markdown(f"**News context for {chosen_scan}:**")
+            nc1, nc2, nc3 = st.columns(3)
+            nc1.metric("Mentions",      chosen_data["Mentions"])
+            nc2.metric("Avg Sentiment", chosen_data["Avg Sentiment"])
+            nc3.metric("Sentiment",     chosen_data["Sentiment"])
+            t = chosen_data["Time"]
+            if len(t) == 8:
+                t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
+            st.markdown(
+                f"**Top headline:** [{chosen_data['Top Headline']}]({chosen_data['URL']})  \n"
+                f"*{chosen_data['Source']} · {t}*"
+            )
+
+        st.divider()
+        st.markdown(f"**Quick technical check for {chosen_scan}** (yfinance only — free)")
+        if st.button(f"Run technical scan for {chosen_scan}", key="market_scan_tech"):
+            stats = get_quick_stats(
+                chosen_scan, get_data, add_indicators,
+                score_stock, get_signal_short, safe_float
+            )
+            if stats is None:
+                st.error(f"No data found for {chosen_scan}")
+            else:
+                qt1, qt2, qt3, qt4 = st.columns(4)
+                qt1.metric("Close",          f"${stats['close']:.2f}")
+                qt2.metric("RSI",            f"{stats['rsi']:.1f}")
+                qt3.metric("Research Score", f"{stats['score']}/100")
+                qt4.metric("Signal",         stats["signal"])
+                render_signal_banner(stats["score"], get_signal(stats["score"]))
+
+                fig_scan = go.Figure()
+                fig_scan.add_trace(go.Candlestick(
+                    x=stats["data"].index,
+                    open=stats["data"]["Open"],
+                    high=stats["data"]["High"],
+                    low=stats["data"]["Low"],
+                    close=stats["data"]["Close"],
+                    name="Price"
+                ))
+                fig_scan.add_trace(go.Scatter(
+                    x=stats["data"].index, y=stats["data"]["MA20"], name="MA20"
+                ))
+                fig_scan.add_trace(go.Scatter(
+                    x=stats["data"].index, y=stats["data"]["MA50"], name="MA50"
+                ))
+                fig_scan.update_layout(
+                    height=400, xaxis_rangeslider_visible=False,
+                    title=f"{chosen_scan} — 3 Month Chart (data may be delayed ~15 min)"
+                )
+                st.plotly_chart(fig_scan, use_container_width=True)
+                render_score_breakdown(stats["reasons"], DISCLAIMER)
+
+        st.divider()
+        st.markdown(f"**Send {chosen_scan} to Deep Dive for full Phase 2 analysis**")
+        st.caption(
+            "Adding to your watchlist lets you fetch news sentiment, insider disclosures, "
+            "SEC filings, and run the AI summary in the Deep Dive tab."
+        )
+        if st.button(f"Add {chosen_scan} to watchlist", key="market_scan_add"):
+            current_list = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+            if chosen_scan in current_list:
+                st.info(f"{chosen_scan} is already in your watchlist.")
+            else:
+                new_input = tickers_input.rstrip(", ") + f", {chosen_scan}"
+                st.success(
+                    f"**{chosen_scan}** is ready to add. "
+                    f"Update your sidebar watchlist input to:  \n"
+                    f"`{new_input}`  \n"
+                    f"Then select **{chosen_scan}** in the Deep Dive dropdown."
+                )
+        st.info(
+            f"**Full research flow for {chosen_scan}:**\n"
+            "1. Add to sidebar watchlist\n"
+            "2. Go to Deep Dive + Phase 2 tab\n"
+            "3. Fetch news sentiment (1 Alpha Vantage request)\n"
+            "4. Fetch insider disclosures (1 Finnhub request)\n"
+            "5. Check SEC filings in Public Disclosures tab\n"
+            "6. Use free ChatGPT prompt or OpenAI button for AI analysis\n"
+            "7. Log a paper trade if the setup looks interesting\n\n"
+            "⚠️ All analysis is for educational research only. Not financial advice."
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Public Disclosures
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.subheader("Public Disclosures — SEC EDGAR")
+    st.info(
+        "📋 **About this tab:** All data comes directly from the SEC's public EDGAR database. "
+        "No non-public or confidential information is accessed. "
+        "Form 4 insiders have up to 2 business days to file. "
+        "13F institutional filings are delayed by 45 days. "
+        "For educational research only. Not financial advice."
+    )
+    st.caption(
+        "⚙️ SEC fair-access guidelines allow a maximum of 10 requests per second. "
+        "This app uses manual confirmation gates and SQLite caching to stay well under that limit. "
+        "SEC User-Agent is configured securely through Streamlit Secrets."
+    )
+
+    st.subheader("Step 1 — Company Lookup")
+    st.caption(
+        "Enter a ticker to find its SEC CIK number and company name. "
+        "Results are cached in SQLite — repeat lookups are free and instant."
+    )
+
+    lookup_col1, lookup_col2 = st.columns([2, 1])
+    lookup_ticker = lookup_col1.text_input(
+        "Ticker to look up", value=selected, key="sec_lookup_ticker"
+    ).upper().strip()
+
+    sec_rem  = requests_remaining("sec", SEC_DAILY_LIMIT)
+    lookup_col2.metric("SEC Requests Left", f"{sec_rem} / {SEC_DAILY_LIMIT}")
+
+    cached_info  = load_sec_company_cache(lookup_ticker)
+    company_info = None
+
+    if cached_info:
+        st.success(
+            f"Loaded from cache (fetched {cached_info['fetched_date']}) — no SEC request used."
+        )
+        company_info = cached_info
+    else:
+        st.caption(
+            f"No cached data for **{lookup_ticker}**. "
+            f"Looking up will use 1 SEC request ({sec_rem - 1} remaining after)."
+        )
+        if sec_rem <= 0:
+            st.error("No SEC requests left today. Resets at midnight.")
+        elif st.button(
+            f"Confirm — look up {lookup_ticker} on SEC EDGAR",
+            key="sec_lookup_btn"
+        ):
+            with st.spinner(f"Looking up {lookup_ticker} on SEC EDGAR..."):
+                company_info, err = get_sec_company_info(
+                    lookup_ticker, sec_agent, increment_usage,
+                    save_sec_company_cache, load_sec_company_cache,
+                )
+            if err:
+                st.error(f"Lookup failed: {err}")
+                company_info = None
+            else:
+                st.rerun()
+
+    if company_info:
+        st.divider()
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Company Name", company_info["company_name"])
+        r2.metric("Ticker",       lookup_ticker)
+        r3.metric("CIK",          company_info["cik"])
+
+        sec_base = (
+            f"https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcompany&CIK={company_info['cik']}"
+        )
+        st.markdown(
+            f"🔗 [View all SEC filings for {company_info['company_name']}]"
+            f"({sec_base}&type=&dateb=&owner=include&count=40&search_text=)  \n"
+            f"🔗 [SEC submissions JSON]({company_info['submissions_url']})"
+        )
+        st.caption("Links open the official SEC EDGAR website.")
+
+        st.divider()
+        st.subheader("Step 2 — Recent SEC Filings")
+        st.caption("Results cached for today — repeat fetches are free.")
+
+        with st.expander("What do these SEC form types mean?", expanded=False):
+            st.markdown("""
+| Form | What it means |
+|---|---|
+| **Form 4** | Insider transaction disclosure — filed within 2 business days of the transaction. |
+| **8-K** | Major company event — earnings surprises, CEO changes, mergers. Filed within 4 business days. |
+| **10-Q** | Quarterly financial report — unaudited, filed within 40–45 days after quarter end. |
+| **10-K** | Annual financial report — audited, filed within 60–90 days after fiscal year end. |
+| **13F-HR** | Institutional holdings — filed quarterly, delayed up to 45 days after quarter end. |
+| **13F-HR/A** | Amended institutional holdings report. |
+""")
+            st.caption(
+                "All forms are publicly required disclosures. "
+                "Always check filed date vs report date. For educational research only."
+            )
+
+        form_filter = st.multiselect(
+            "Filter by form type",
+            options=["4", "10-K", "10-Q", "8-K", "13F-HR", "13F-HR/A"],
+            default=["4", "10-K", "10-Q", "8-K"],
+            key="sec_form_filter"
+        )
+
+        cached_filings = load_sec_filings_cache(lookup_ticker)
+        filings        = None
+
+        if cached_filings:
+            filings = cached_filings
+            st.success("Filings loaded from cache — no SEC request used.")
+        else:
+            st.caption(
+                f"No cached filings for **{lookup_ticker}** today. "
+                f"Fetching will use 1 SEC request ({sec_rem - 1} remaining after)."
+            )
+            if sec_rem <= 0:
+                st.error("No SEC requests left today.")
+            elif st.button(
+                f"Confirm — fetch recent SEC filings for {lookup_ticker}",
+                key="sec_filings_btn"
+            ):
+                with st.spinner(f"Fetching SEC filings for {lookup_ticker}..."):
+                    filings, err, _ = get_sec_filings(
+                        lookup_ticker, company_info["cik"],
+                        sec_agent, increment_usage,
+                        save_sec_filings_cache, load_sec_filings_cache,
+                        form_types=None,
+                    )
+                if err:
+                    st.error(f"Could not load filings: {err}")
+                    filings = None
+                else:
+                    st.rerun()
+
+        if filings:
+            filtered = [f for f in filings if not form_filter or f["Form"] in form_filter]
+            st.caption(
+                f"Showing {len(filtered)} filings (filtered from {len(filings)} total). "
+                "Click links to view official SEC documents."
+            )
+            if filtered:
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Form":        f["Form"],
+                        "Filed":       f["Filed"],
+                        "Report Date": f["Report Date"],
+                        "Accession":   f["Accession"],
+                    } for f in filtered]),
+                    use_container_width=True, hide_index=True
+                )
+                st.markdown("**Filing links:**")
+                for f in filtered[:15]:
+                    col_f1, col_f2 = st.columns([3, 1])
+                    col_f1.markdown(
+                        f"**{f['Form']}** — Filed: {f['Filed']} | "
+                        f"Report: {f['Report Date']}  \n"
+                        f"Accession: `{f['Accession']}`"
+                    )
+                    col_f2.markdown(
+                        f"[View Filing]({f['Filing URL']}) | [Index]({f['Index URL']})"
+                        if f["Index URL"] else
+                        f"[View Filing]({f['Filing URL']})"
+                    )
+                    st.divider()
+                st.caption(
+                    "All links open official SEC EDGAR pages. "
+                    "Data is publicly available and may be delayed per SEC filing requirements."
+                )
+            else:
+                st.info("No filings found for the selected form types.")
+
+        render_disclaimer(DISCLAIMER)
+        st.caption(
+            "📋 All SEC data shown here is publicly available through SEC EDGAR. "
+            "This tool accesses no non-public or confidential information. "
+            "For educational research only."
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — Paper Trade Log
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab7:
     st.subheader("Paper Trade Log")
     st.info(
         "📋 **Paper Trading Only:** All trades logged here are hypothetical and for educational "
@@ -1222,29 +1142,40 @@ with tab5:
 
         raw_ind = get_data(trade_ticker, period)
         if not raw_ind.empty:
-            ind_data       = add_indicators(raw_ind.copy())
-            ind_latest     = ind_data.iloc[-1]
-            trade_score, _ = score_stock(ind_data)
-            trade_signal   = get_signal_short(trade_score)
-            trade_rsi      = safe_float(ind_latest["RSI"])
-            trade_ma20     = safe_float(ind_latest["MA20"])
-            trade_ma50     = safe_float(ind_latest["MA50"])
+            ind_data        = add_indicators(raw_ind.copy())
+            ind_latest      = ind_data.iloc[-1]
+            trade_score, _  = score_stock(ind_data)
+            trade_signal    = get_signal_short(trade_score)
+            trade_rsi       = safe_float(ind_latest["RSI"])
+            trade_ma20      = safe_float(ind_latest["MA20"])
+            trade_ma50      = safe_float(ind_latest["MA50"])
         else:
-            trade_score = 0; trade_signal = "Unknown"
-            trade_rsi = 0.0; trade_ma20 = 0.0; trade_ma50 = 0.0
+            trade_score = 0;  trade_signal = "Unknown"
+            trade_rsi   = 0.0; trade_ma20 = 0.0; trade_ma50 = 0.0
 
         trade_notes = st.text_input("Research notes (optional)")
-        st.caption(f"Will save with: Score {trade_score}/100 | RSI {trade_rsi:.1f} | Signal: {trade_signal}")
+        st.caption(
+            f"Will save with: Score {trade_score}/100 | "
+            f"RSI {trade_rsi:.1f} | Signal: {trade_signal}"
+        )
 
         if st.button("Log Paper Trade"):
             save_trade(
-                entry_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                ticker=trade_ticker, action=trade_action_clean,
-                entry_price=trade_price, ai_score=trade_score,
-                rsi=trade_rsi, ma20=trade_ma20, ma50=trade_ma50,
-                signal=trade_signal, notes=trade_notes
+                entry_date  = datetime.now().strftime("%Y-%m-%d %H:%M"),
+                ticker      = trade_ticker,
+                action      = trade_action_clean,
+                entry_price = trade_price,
+                ai_score    = trade_score,
+                rsi         = trade_rsi,
+                ma20        = trade_ma20,
+                ma50        = trade_ma50,
+                signal      = trade_signal,
+                notes       = trade_notes,
             )
-            st.success(f"Paper trade logged: {trade_action_clean} {trade_ticker} at ${trade_price:.2f} (hypothetical)")
+            st.success(
+                f"Paper trade logged: {trade_action_clean} {trade_ticker} "
+                f"at ${trade_price:.2f} (hypothetical)"
+            )
             st.rerun()
 
     trades_df = load_trades()
@@ -1261,29 +1192,43 @@ with tab5:
             for _, row in open_trades.iterrows():
                 current_price = get_current_price(row["ticker"])
                 if current_price and row["entry_price"] > 0:
-                    gain_pct = ((current_price - row["entry_price"]) / row["entry_price"]) * 100
-                    if row["action"] == "SELL": gain_pct = -gain_pct
+                    gain_pct = (
+                        (current_price - row["entry_price"]) / row["entry_price"] * 100
+                    )
+                    if row["action"] == "SELL":
+                        gain_pct = -gain_pct
                     gain_str = f"{gain_pct:+.2f}% (hypothetical)"
                 else:
-                    current_price = 0.0; gain_str = "N/A"
+                    current_price = 0.0
+                    gain_str      = "N/A"
                 try:
-                    days_open = (datetime.now() - datetime.strptime(row["entry_date"], "%Y-%m-%d %H:%M")).days
+                    days_open = (
+                        datetime.now() -
+                        datetime.strptime(row["entry_date"], "%Y-%m-%d %H:%M")
+                    ).days
                 except:
                     days_open = 0
                 perf_rows.append({
-                    "ID": row["id"], "Date": row["entry_date"],
-                    "Ticker": row["ticker"], "Action": row["action"],
-                    "Entry $": f"${row['entry_price']:.2f}",
-                    "Current $": f"${current_price:.2f}",
-                    "Hypothetical P/L": gain_str, "Days Open": days_open,
-                    "Score@Entry": f"{row['ai_score']}/100",
-                    "RSI@Entry": f"{row['rsi']:.1f}",
-                    "Signal@Entry": row["signal"], "Notes": row["notes"]
+                    "ID":               row["id"],
+                    "Date":             row["entry_date"],
+                    "Ticker":           row["ticker"],
+                    "Action":           row["action"],
+                    "Entry $":          f"${row['entry_price']:.2f}",
+                    "Current $":        f"${current_price:.2f}",
+                    "Hypothetical P/L": gain_str,
+                    "Days Open":        days_open,
+                    "Score@Entry":      f"{row['ai_score']}/100",
+                    "RSI@Entry":        f"{row['rsi']:.1f}",
+                    "Signal@Entry":     row["signal"],
+                    "Notes":            row["notes"],
                 })
 
             perf_df = pd.DataFrame(perf_rows)
-            st.dataframe(perf_df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
-            st.caption(DISCLAIMER)
+            st.dataframe(
+                perf_df.drop(columns=["ID"]),
+                use_container_width=True, hide_index=True
+            )
+            render_disclaimer(DISCLAIMER)
 
             st.subheader("Manage paper trades")
             trade_ids    = open_trades["id"].tolist()
@@ -1291,25 +1236,38 @@ with tab5:
                 f"{r['ticker']} {r['action']} @ ${r['entry_price']:.2f} ({r['entry_date']})"
                 for _, r in open_trades.iterrows()
             ]
-            sel_label  = st.selectbox("Select a trade", trade_labels)
-            sel_id     = trade_ids[trade_labels.index(sel_label)]
-            mc1, mc2   = st.columns(2)
+            sel_label = st.selectbox("Select a trade", trade_labels)
+            sel_id    = trade_ids[trade_labels.index(sel_label)]
+            mc1, mc2  = st.columns(2)
             if mc1.button("Mark as Closed"):
-                close_trade(sel_id); st.success("Marked as closed."); st.rerun()
+                close_trade(sel_id)
+                st.success("Marked as closed.")
+                st.rerun()
             if mc2.button("Delete Trade"):
-                delete_trade(sel_id); st.success("Deleted."); st.rerun()
+                delete_trade(sel_id)
+                st.success("Deleted.")
+                st.rerun()
 
         closed_trades = trades_df[trades_df["status"] == "Closed"]
         if not closed_trades.empty:
             st.subheader("Closed Paper Trades")
             st.dataframe(
-                closed_trades[["entry_date","ticker","action","entry_price",
-                               "ai_score","rsi","signal","notes"]].rename(columns={
-                    "entry_date": "Date", "ticker": "Ticker", "action": "Action",
-                    "entry_price": "Entry $", "ai_score": "Score@Entry",
-                    "rsi": "RSI@Entry", "signal": "Signal@Entry", "notes": "Notes"
-                }), use_container_width=True, hide_index=True)
-            st.caption(DISCLAIMER)
+                closed_trades[[
+                    "entry_date", "ticker", "action", "entry_price",
+                    "ai_score", "rsi", "signal", "notes"
+                ]].rename(columns={
+                    "entry_date":  "Date",
+                    "ticker":      "Ticker",
+                    "action":      "Action",
+                    "entry_price": "Entry $",
+                    "ai_score":    "Score@Entry",
+                    "rsi":         "RSI@Entry",
+                    "signal":      "Signal@Entry",
+                    "notes":       "Notes",
+                }),
+                use_container_width=True, hide_index=True
+            )
+            render_disclaimer(DISCLAIMER)
 
     st.divider()
     st.caption(
