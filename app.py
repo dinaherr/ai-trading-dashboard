@@ -154,8 +154,8 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 # ── Cached market scan wrapper ────────────────────────────────────────────────
 @st.cache_data(ttl=1800)
-def cached_market_sentiment_scan(key):
-    return fetch_market_sentiment_scan(key, increment_usage)
+def cached_market_sentiment_scan(key, pages):
+    return fetch_market_sentiment_scan(key, increment_usage, pages=pages)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
