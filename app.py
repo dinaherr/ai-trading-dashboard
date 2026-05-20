@@ -154,9 +154,9 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 # ── Cached market scan wrapper ────────────────────────────────────────────────
 @st.cache_data(ttl=1800)
-def cached_market_sentiment_scan():
-    return fetch_market_sentiment_scan(alpha_key, increment_usage)
-
+def cached_market_sentiment_scan(key):
+    return fetch_market_sentiment_scan(key, increment_usage)
+    
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Watchlist Overview",
@@ -796,7 +796,7 @@ with tab5:
 
         if st.button("Confirm — Run Market Sentiment Scan (1 request)", key="run_market_scan"):
             with st.spinner("Scanning market news..."):
-                scan_results, scan_err = cached_market_sentiment_scan()
+                scan_results, scan_err = cached_market_sentiment_scan(alpha_key)
             if scan_err:
                 st.error(f"Scan failed: {scan_err}")
             else:
