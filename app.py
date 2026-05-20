@@ -840,9 +840,11 @@ with tab5:
             if val == "Bearish": return "color: red"
             return "color: gray"
 
-        st.dataframe(
-            table_df.style.applymap(sentiment_color, subset=["Sentiment"]),
-            use_container_width=True, hide_index=True
+       # AFTER
+st.dataframe(
+    table_df.style.map(sentiment_color, subset=["Sentiment"]),
+    use_container_width=True, hide_index=True
+)
         )
         render_disclaimer(DISCLAIMER)
 
