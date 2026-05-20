@@ -767,17 +767,16 @@ with tab4:
             "7. Log a paper trade if the setup looks interesting\n\n"
             "⚠️ All analysis is for educational research only. Not financial advice."
         )
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Market Sentiment Scanner
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab5:
     st.subheader("Market Sentiment Scanner")
     st.info(
-        "📡 This scanner fetches broad market news from Alpha Vantage without filtering by ticker. "
-        "It costs **exactly 1 Alpha Vantage request** and surfaces the top 15 most-mentioned "
-        "tickers from recent news, ranked by coverage and sentiment. "
-        "Use this to discover tickers you didn't know to look for. "
+        "📡 This scanner fetches broad market news from Alpha Vantage. "
+        "It fetches up to **3 pages of articles** (3 requests) covering the last 1–2 days "
+        "of news, surfaces the **top 20 most-mentioned tickers**, and shows "
+        "**which sectors are getting the most coverage**. "
         "For educational research only. Not financial advice."
     )
 
@@ -787,25 +786,42 @@ with tab5:
     sc1, sc2, sc3 = st.columns(3)
     sc1.metric("Alpha Vantage Remaining", f"{av_rem} / {AV_DAILY_LIMIT}")
     sc2.metric("Used Today",              str(av_used))
-    sc3.metric("This scan costs",         "1 request")
+    sc3.metric("This scan costs",         "up to 3 requests")
     st.progress(min(av_used / AV_DAILY_LIMIT, 1.0))
 
     if av_rem <= 0:
         st.error("No Alpha Vantage requests left today. Resets at midnight.")
     else:
-        if av_rem <= 5:
-            st.error(f"Only {av_rem} Alpha Vantage requests left — use carefully.")
+        if av_rem < 3:
+            st.error(
+                f"Only {av_rem} request(s) left — scan will fetch as many pages as possible."
+            )
+        elif av_rem <= 5:
+            st.warning(f"Only {av_rem} requests left today — scan uses up to 3.")
         elif av_rem <= 10:
             st.warning(f"{av_rem} Alpha Vantage requests left today.")
 
+        # Let user choose how many pages
+        pages_to_fetch = st.slider(
+            "Pages to fetch (each page = 1 request, ~50 articles)",
+            min_value=1, max_value=min(3, av_rem),
+            value=min(3, av_rem),
+            help="More pages = more tickers found, covers 1-2 days back. Each page costs 1 request."
+        )
         st.caption(
-            "Fetches the 50 most recent market news articles and extracts every ticker mentioned. "
-            "Results are cached for 30 minutes — refreshing does not cost another request."
+            f"Fetching **{pages_to_fetch} page(s)** = ~{pages_to_fetch * 50} articles. "
+            f"Covers approximately {'today only' if pages_to_fetch == 1 else '1–2 days'} of news. "
+            "Results cached for 30 minutes — refreshing the page does not cost more requests."
         )
 
-        if st.button("Confirm — Run Market Sentiment Scan (1 request)", key="run_market_scan"):
-            with st.spinner("Scanning market news..."):
-                scan_results, scan_err = cached_market_sentiment_scan(alpha_key)
+        if st.button(
+            f"Confirm — Run Market Sentiment Scan ({pages_to_fetch} request(s))",
+            key="run_market_scan"
+        ):
+            with st.spinner("Scanning market news across multiple article pages..."):
+                scan_results, scan_err = cached_market_sentiment_scan(
+                    alpha_key, pages_to_fetch
+                )
             if scan_err:
                 st.error(f"Scan failed: {scan_err}")
             else:
@@ -816,30 +832,84 @@ with tab5:
         results   = st.session_state["market_scan_results"]
         scan_time = st.session_state.get("market_scan_time", "unknown")
 
+        pages_used    = results.get("pages_fetched", 1)
+        total_arts    = results.get("total_articles", 0)
+        ticker_list   = results.get("tickers", [])
+        sector_list   = results.get("sector_summary", [])
+
         st.divider()
-        st.subheader(f"Top 15 Most-Covered Tickers — scanned {scan_time}")
         st.caption(
-            "Ranked by article mentions then sentiment score. "
-            "Higher mentions = more news coverage. For research only — not a recommendation."
+            f"Scanned {total_arts} unique articles across {pages_used} page(s) — "
+            f"last run: {scan_time}"
+        )
+
+        # ── Sector summary ────────────────────────────────────────────────────
+        st.subheader("Sector Activity Summary")
+        st.caption(
+            "Which sectors are getting the most news coverage right now? "
+            "Sorted by total article mentions. For research only."
+        )
+
+        if sector_list:
+            sector_df = pd.DataFrame(sector_list)
+
+            def sector_sentiment_color(val):
+                if val == "Bullish": return "color: green"
+                if val == "Bearish": return "color: red"
+                return "color: gray"
+
+            st.dataframe(
+                sector_df.style.map(sector_sentiment_color, subset=["Sentiment"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # Sector mentions bar chart
+            fig_sectors = px.bar(
+                sector_df.head(10),
+                x="Sector", y="Total Mentions",
+                color="Sentiment",
+                color_discrete_map={
+                    "Bullish": "green", "Neutral": "gold", "Bearish": "red"
+                },
+                title="Top Sectors by Article Mentions",
+                text="Total Mentions",
+            )
+            fig_sectors.update_layout(
+                height=400,
+                xaxis_tickangle=-30,
+                showlegend=True,
+            )
+            fig_sectors.update_traces(textposition="outside")
+            st.plotly_chart(fig_sectors, use_container_width=True)
+
+        st.divider()
+
+        # ── Top 20 tickers ────────────────────────────────────────────────────
+        st.subheader(f"Top 20 Most-Covered Tickers — scanned {scan_time}")
+        st.caption(
+            "Ranked by number of article mentions then sentiment score. "
+            "Includes tickers from up to 2 days of news. "
+            "For research only — not a recommendation."
         )
 
         table_rows = []
-        for r in results:
+        for r in ticker_list:
             t = r["Time"]
             if len(t) == 8:
                 t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
             table_rows.append({
                 "Ticker":        r["Ticker"],
+                "Sector":        r["Sector"],
                 "Mentions":      r["Mentions"],
                 "Avg Sentiment": r["Avg Sentiment"],
                 "Sentiment":     r["Sentiment"],
                 "Top Headline":  (
-                    r["Top Headline"][:80] + "..."
-                    if len(r["Top Headline"]) > 80
+                    r["Top Headline"][:75] + "..."
+                    if len(r["Top Headline"]) > 75
                     else r["Top Headline"]
                 ),
                 "Source":        r["Source"],
-                "Latest":        t,
+                "Date":          t,
             })
 
         table_df = pd.DataFrame(table_rows)
@@ -849,28 +919,55 @@ with tab5:
             if val == "Bearish": return "color: red"
             return "color: gray"
 
-        # ── Fix applied: style.map instead of style.applymap ─────────────────
         st.dataframe(
             table_df.style.map(sentiment_color, subset=["Sentiment"]),
             use_container_width=True, hide_index=True
         )
         render_disclaimer(DISCLAIMER)
 
+        # ── Filter by sector ──────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Filter by Sector")
+        available_sectors = sorted(set(r["Sector"] for r in ticker_list))
+        chosen_sector     = st.selectbox(
+            "Show tickers from sector",
+            ["All sectors"] + available_sectors,
+            key="market_scan_sector_filter"
+        )
+
+        filtered_tickers = (
+            ticker_list if chosen_sector == "All sectors"
+            else [r for r in ticker_list if r["Sector"] == chosen_sector]
+        )
+
+        if filtered_tickers:
+            st.caption(
+                f"Showing {len(filtered_tickers)} ticker(s) "
+                f"{'across all sectors' if chosen_sector == 'All sectors' else f'in {chosen_sector}'}."
+            )
+        else:
+            st.info(f"No tickers found in {chosen_sector} from this scan.")
+
+        # ── Explore a ticker ──────────────────────────────────────────────────
         st.divider()
         st.subheader("Explore a Ticker from the Scan")
-        chosen_scan = st.selectbox(
+        st.caption("Select any ticker to see its news context and run a free technical check.")
+
+        explore_options = [r["Ticker"] for r in filtered_tickers] if filtered_tickers else [r["Ticker"] for r in ticker_list]
+        chosen_scan     = st.selectbox(
             "Select a ticker to explore",
-            [r["Ticker"] for r in results],
+            explore_options,
             key="market_scan_chosen"
         )
 
-        chosen_data = next((r for r in results if r["Ticker"] == chosen_scan), None)
+        chosen_data = next((r for r in ticker_list if r["Ticker"] == chosen_scan), None)
         if chosen_data:
             st.markdown(f"**News context for {chosen_scan}:**")
-            nc1, nc2, nc3 = st.columns(3)
+            nc1, nc2, nc3, nc4 = st.columns(4)
             nc1.metric("Mentions",      chosen_data["Mentions"])
             nc2.metric("Avg Sentiment", chosen_data["Avg Sentiment"])
             nc3.metric("Sentiment",     chosen_data["Sentiment"])
+            nc4.metric("Sector",        chosen_data["Sector"])
             t = chosen_data["Time"]
             if len(t) == 8:
                 t = f"{t[:4]}-{t[4:6]}-{t[6:]}"
@@ -879,6 +976,7 @@ with tab5:
                 f"*{chosen_data['Source']} · {t}*"
             )
 
+        # ── Quick technical check ─────────────────────────────────────────────
         st.divider()
         st.markdown(f"**Quick technical check for {chosen_scan}** (yfinance only — free)")
         if st.button(f"Run technical scan for {chosen_scan}", key="market_scan_tech"):
@@ -887,7 +985,7 @@ with tab5:
                 score_stock, get_signal_short, safe_float
             )
             if stats is None:
-                st.error(f"No data found for {chosen_scan}")
+                st.error(f"No price data found for {chosen_scan}")
             else:
                 qt1, qt2, qt3, qt4 = st.columns(4)
                 qt1.metric("Close",          f"${stats['close']:.2f}")
@@ -906,18 +1004,24 @@ with tab5:
                     name="Price"
                 ))
                 fig_scan.add_trace(go.Scatter(
-                    x=stats["data"].index, y=stats["data"]["MA20"], name="MA20"
+                    x=stats["data"].index,
+                    y=stats["data"]["MA20"],
+                    name="MA20"
                 ))
                 fig_scan.add_trace(go.Scatter(
-                    x=stats["data"].index, y=stats["data"]["MA50"], name="MA50"
+                    x=stats["data"].index,
+                    y=stats["data"]["MA50"],
+                    name="MA50"
                 ))
                 fig_scan.update_layout(
-                    height=400, xaxis_rangeslider_visible=False,
+                    height=400,
+                    xaxis_rangeslider_visible=False,
                     title=f"{chosen_scan} — 3 Month Chart (data may be delayed ~15 min)"
                 )
                 st.plotly_chart(fig_scan, use_container_width=True)
                 render_score_breakdown(stats["reasons"], DISCLAIMER)
 
+        # ── Send to Deep Dive ─────────────────────────────────────────────────
         st.divider()
         st.markdown(f"**Send {chosen_scan} to Deep Dive for full Phase 2 analysis**")
         st.caption(
